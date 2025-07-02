@@ -1,0 +1,8 @@
+.terraform*
+.terraform/
+.venv
+ansible/inventory.ini
+export/
+mystate.tf
+terraform.*
+variables.tf.bak.*

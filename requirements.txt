@@ -1,0 +1,7 @@
+oci>=2.155.0
+python-terraform>=1.0.0
+click>=8.0.0
+cryptography>=3.2.1
+jinja2>=3.0.0 
+pyyaml>=5.4
+rich>=13.0.0
