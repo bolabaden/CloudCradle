@@ -17,6 +17,7 @@
 #   - Robust existing resource import
 
 set -euo pipefail
+#set -x
 
 # ============================================================================
 # CONFIGURATION AND CONSTANTS
@@ -28,6 +29,7 @@ AUTO_USE_EXISTING=${AUTO_USE_EXISTING:-false}
 AUTO_DEPLOY=${AUTO_DEPLOY:-false}
 SKIP_CONFIG=${SKIP_CONFIG:-false}
 DEBUG=${DEBUG:-false}
+FORCE_REAUTH=${FORCE_REAUTH:-false}
 
 # Optional Terraform remote backend (set to 'oci' to use OCI Object Storage S3-compatible backend)
 TF_BACKEND=${TF_BACKEND:-local}                # values: local | oci
@@ -42,6 +44,19 @@ TF_BACKEND_SECRET_KEY=${TF_BACKEND_SECRET_KEY:-""}   # (optional) S3 secret key
 # Retry/backoff settings for transient errors like 'Out of Capacity'
 RETRY_MAX_ATTEMPTS=${RETRY_MAX_ATTEMPTS:-8}
 RETRY_BASE_DELAY=${RETRY_BASE_DELAY:-15}  # seconds
+
+# Timeout for OCI CLI calls (seconds). Set lower if your environment can be slow.
+OCI_CMD_TIMEOUT=${OCI_CMD_TIMEOUT:-20}
+# If no coreutils timeout is available, the script attempts to still run but may block on slow OCI CLI calls.
+
+# OCI CLI configuration
+OCI_CONFIG_FILE=${OCI_CONFIG_FILE:-"$HOME/.oci/config"}
+OCI_PROFILE=${OCI_PROFILE:-"DEFAULT"}
+OCI_AUTH_REGION=${OCI_AUTH_REGION:-""}
+OCI_CLI_CONNECTION_TIMEOUT=${OCI_CLI_CONNECTION_TIMEOUT:-10}
+OCI_CLI_READ_TIMEOUT=${OCI_CLI_READ_TIMEOUT:-60}
+OCI_CLI_MAX_RETRIES=${OCI_CLI_MAX_RETRIES:-3}
+
 
 
 # Oracle Free Tier Limits (as of 2025)
@@ -124,6 +139,42 @@ print_debug() {
     fi
 }
 
+prompt_with_default() {
+    local prompt="$1"
+    local default_value="$2"
+    local input
+
+    # Print prompt to stderr so command substitutions capture only the answer
+    printf "%s%s [%s]: %s" "${BLUE}" "${prompt}" "${default_value}" "${NC}" 1>&2
+    read -r input
+    # Normalize input: remove CR (Windows line endings) and trim whitespace
+    input=$(echo "$input" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [ -z "$input" ]; then
+        echo "$default_value"
+    else
+        echo "$input"
+    fi
+} 
+
+prompt_int_range() {
+    local prompt="$1"
+    local default_value="$2"
+    local min_value="$3"
+    local max_value="$4"
+    local value
+
+    while true; do
+        value=$(prompt_with_default "$prompt" "$default_value")
+        # Normalize input in case of CR or surrounding whitespace
+        value=$(echo "$value" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge "$min_value" ] && [ "$value" -le "$max_value" ]; then
+            echo "$value"
+            return 0
+        fi
+        print_error "Please enter a number between $min_value and $max_value (received: '$value')"
+    done
+} 
+
 print_header() {
     echo ""
     echo -e "${BOLD}${MAGENTA}════════════════════════════════════════════════════════════════${NC}"
@@ -146,35 +197,187 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+is_wsl() {
+    grep -qiE "microsoft|wsl" /proc/version 2>/dev/null
+}
+
+default_region_for_host() {
+    # Best-effort heuristic when the user doesn't specify a region.
+    # Prefers "nearby" regions based on system timezone.
+    local tz
+    tz=$(cat /etc/timezone 2>/dev/null || true)
+    tz=${tz:-""}
+
+    case "$tz" in
+        *Chicago*|*Central*|*Winnipeg*|*Mexico_City*) echo "us-chicago-1" ;;
+        *New_York*|*Toronto*|*Montreal*|*Eastern*) echo "us-ashburn-1" ;;
+        *Los_Angeles*|*Vancouver*|*Pacific*) echo "us-sanjose-1" ;;
+        *Phoenix*|*Denver*|*Mountain*) echo "us-phoenix-1" ;;
+        *London*|*Dublin*) echo "uk-london-1" ;;
+        *Paris*|*Berlin*|*Rome*|*Madrid*|*Amsterdam*|*Stockholm*|*Zurich*|*Europe*) echo "eu-frankfurt-1" ;;
+        *Tokyo*) echo "ap-tokyo-1" ;;
+        *Seoul*) echo "ap-seoul-1" ;;
+        *Singapore*) echo "ap-singapore-1" ;;
+        *Sydney*|*Melbourne*) echo "ap-sydney-1" ;;
+        *) echo "us-chicago-1" ;;
+    esac
+}
+
+open_url_best_effort() {
+    local url="$1"
+    if [ -z "$url" ]; then
+        return 1
+    fi
+
+    if is_wsl && command_exists powershell.exe; then
+        # Open in Windows default browser with correct quoting (avoid cmd.exe splitting on '&')
+        powershell.exe -NoProfile -Command "Start-Process '$url'" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    if command_exists xdg-open; then
+        xdg-open "$url" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    if command_exists open; then
+        open "$url" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    return 1
+}
+
+read_oci_config_value() {
+    local key="$1"
+    local file="${2:-$OCI_CONFIG_FILE}"
+    local profile="${3:-$OCI_PROFILE}"
+
+    if [ ! -f "$file" ]; then
+        return 1
+    fi
+
+    awk -v key="$key" -v profile="$profile" '
+        BEGIN { section = "" }
+        /^[[:space:]]*\[/ { section = $0; next }
+        section == "["profile"]" {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            if (line ~ "^"key"[[:space:]]*=") {
+                sub("^"key"[[:space:]]*=", "", line)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+                print line
+                exit
+            }
+        }
+    ' "$file"
+}
+
+is_instance_principal_available() {
+    if ! command_exists curl; then
+        return 1
+    fi
+    # Quick reachability check to OCI metadata service (non-blocking)
+    curl -s --connect-timeout 1 --max-time 2 http://169.254.169.254/opc/v2/ >/dev/null 2>&1
+}
+
+validate_existing_oci_config() {
+    if [ ! -f "$OCI_CONFIG_FILE" ]; then
+        print_warning "OCI config not found at $OCI_CONFIG_FILE"
+        return 1
+    fi
+
+    local cfg_auth
+    local key_file
+    local token_file
+    local pass_phrase
+
+    cfg_auth=$(read_oci_config_value "auth")
+    key_file=$(read_oci_config_value "key_file")
+    token_file=$(read_oci_config_value "security_token_file")
+    pass_phrase=$(read_oci_config_value "pass_phrase")
+
+    if [ -n "$cfg_auth" ]; then
+        auth_method="$cfg_auth"
+    elif [ -n "$token_file" ]; then
+        auth_method="security_token"
+    elif [ -n "$key_file" ]; then
+        auth_method="api_key"
+    fi
+
+    case "$auth_method" in
+        security_token)
+            if [ -z "$token_file" ] || [ ! -f "$token_file" ]; then
+                print_warning "security_token auth selected but security_token_file is missing"
+                return 1
+            fi
+            ;;
+        api_key)
+            if [ -z "$key_file" ] || [ ! -f "$key_file" ]; then
+                print_warning "api_key auth selected but key_file is missing"
+                return 1
+            fi
+            if grep -q "ENCRYPTED" "$key_file" 2>/dev/null; then
+                if [ -z "${OCI_CLI_PASSPHRASE:-$pass_phrase}" ]; then
+                    print_warning "Private key is encrypted but no passphrase provided (set OCI_CLI_PASSPHRASE or pass_phrase in config)"
+                    return 1
+                fi
+            fi
+            ;;
+        instance_principal|resource_principal|oke_workload_identity|instance_obo_user)
+            if ! is_instance_principal_available; then
+                print_warning "Instance principal auth selected but OCI metadata service is unreachable"
+                return 1
+            fi
+            ;;
+        "")
+            print_warning "Unable to determine auth method from config"
+            return 1
+            ;;
+        *)
+            print_warning "Unsupported auth method '$auth_method' in config"
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
 # Run OCI command with proper authentication handling
 oci_cmd() {
     local cmd="$*"
     local result=""
     local exit_code=0
-    
-    # Try with security_token first if that's our auth method
-    if [ "$auth_method" = "security_token" ]; then
-        result=$(eval "oci $cmd --auth security_token" 2>/dev/null) && exit_code=0 || exit_code=$?
-        if [ $exit_code -eq 0 ] && [ -n "$result" ]; then
-            echo "$result"
-            return 0
+    local base_args
+
+    base_args="--config-file \"$OCI_CONFIG_FILE\" --profile \"$OCI_PROFILE\" --connection-timeout $OCI_CLI_CONNECTION_TIMEOUT --read-timeout $OCI_CLI_READ_TIMEOUT --max-retries $OCI_CLI_MAX_RETRIES"
+    if [ -n "${OCI_CLI_AUTH:-}" ]; then
+        base_args="$base_args --auth $OCI_CLI_AUTH"
+    elif [ -n "$auth_method" ]; then
+        base_args="$base_args --auth $auth_method"
+    fi
+
+    # Internal helper to run with timeout when available
+    _run_oci_with_timeout() {
+        local full_cmd="oci $base_args $cmd $*"
+        if command_exists timeout; then
+            # Use coreutils timeout for safety
+            result=$(timeout "${OCI_CMD_TIMEOUT}s" bash -c "$full_cmd" </dev/null 2>&1) && exit_code=0 || exit_code=$?
+        else
+            # Fallback: run normally (may block if OCI CLI hangs)
+            result=$(eval "$full_cmd" </dev/null 2>&1) && exit_code=0 || exit_code=$?
         fi
-    fi
-    
-    # Fallback to default auth
-    result=$(eval "oci $cmd" 2>/dev/null) && exit_code=0 || exit_code=$?
+    }
+
+    _run_oci_with_timeout ""
     if [ $exit_code -eq 0 ]; then
         echo "$result"
         return 0
     fi
-    
-    # Try with session_token
-    result=$(eval "oci $cmd --auth session_token" 2>/dev/null) && exit_code=0 || exit_code=$?
-    if [ $exit_code -eq 0 ]; then
-        echo "$result"
-        return 0
+    if [ $exit_code -eq 124 ]; then
+        print_warning "OCI CLI call timed out after ${OCI_CMD_TIMEOUT}s"
     fi
-    
+
     return 1
 }
 
@@ -546,14 +749,24 @@ install_terraform() {
 # ============================================================================
 
 detect_auth_method() {
-    if [ -f ~/.oci/config ]; then
-        if grep -q "security_token_file" ~/.oci/config; then
+    if [ -f "$OCI_CONFIG_FILE" ]; then
+        local cfg_auth
+        local token_file
+        local key_file
+
+        cfg_auth=$(read_oci_config_value "auth")
+        token_file=$(read_oci_config_value "security_token_file")
+        key_file=$(read_oci_config_value "key_file")
+
+        if [ -n "$cfg_auth" ]; then
+            auth_method="$cfg_auth"
+        elif [ -n "$token_file" ]; then
             auth_method="security_token"
-        elif grep -q "key_file" ~/.oci/config; then
+        elif [ -n "$key_file" ]; then
             auth_method="api_key"
         fi
     fi
-    print_debug "Detected auth method: $auth_method"
+    print_debug "Detected auth method: $auth_method (profile: $OCI_PROFILE, config: $OCI_CONFIG_FILE)"
 }
 
 setup_oci_config() {
@@ -561,70 +774,392 @@ setup_oci_config() {
     
     mkdir -p ~/.oci
     
-    if [ -f ~/.oci/config ]; then
+    local existing_config_invalid=0
+    if [ -f "$OCI_CONFIG_FILE" ]; then
         print_status "Existing OCI configuration found"
         detect_auth_method
-        
-        # Test existing configuration
-        if test_oci_connectivity; then
-            print_success "Existing OCI configuration is valid"
-            return 0
+
+        print_status "Validating existing OCI configuration..."
+
+        if ! validate_existing_oci_config; then
+            existing_config_invalid=1
+            print_warning "Existing OCI configuration is incomplete or requires interactive input"
+        else
+            # Test existing configuration
+            print_status "Testing existing OCI configuration connectivity..."
+            if test_oci_connectivity; then
+                print_success "Existing OCI configuration is valid"
+                return 0
+            fi
         fi
-        
-        print_warning "Existing configuration failed connectivity test"
+
+        print_warning "Existing configuration failed connectivity test (will retry with refresh)"
         
         # Check if session token expired
         if [ "$auth_method" = "security_token" ]; then
-            print_status "Attempting to refresh session token..."
-            if oci session refresh --profile DEFAULT 2>/dev/null; then
+            print_status "Attempting to refresh session token (timeout ${OCI_CMD_TIMEOUT}s)..."
+            if oci_cmd "session refresh" >/dev/null 2>&1; then
                 if test_oci_connectivity; then
                     print_success "Session token refreshed successfully"
                     return 0
                 fi
+            else
+                print_warning "Session refresh failed or timed out"
             fi
             
-            print_status "Session refresh failed, initiating new authentication..."
+            print_status "Session refresh did not restore connectivity, initiating interactive authentication as a fallback..."
         fi
     fi
     
     # Setup new authentication
     print_status "Setting up browser-based authentication..."
     print_status "This will open a browser window for you to log in to Oracle Cloud."
-    
-    if ! oci session authenticate; then
-        print_error "Browser authentication failed"
+
+    if [ "$NON_INTERACTIVE" = "true" ]; then
+        print_error "Cannot perform interactive authentication in non-interactive mode. Aborting."
         return 1
     fi
-    
-    auth_method="security_token"
-    
-    # Verify the new configuration
-    if test_oci_connectivity; then
-        print_success "OCI authentication configured successfully"
-        return 0
+
+    # Determine region to use for browser login.
+    # If we have an existing config, prefer its region (avoids the region selection prompt).
+    local auth_region
+    auth_region=$(read_oci_config_value "region" "$OCI_CONFIG_FILE" "$OCI_PROFILE" 2>/dev/null || true)
+    auth_region=${auth_region:-$OCI_AUTH_REGION}
+    auth_region=${auth_region:-$(default_region_for_host)}
+
+    # Keep this interactive (per UX request): prompt with a sane default so Enter works.
+    if [ "$NON_INTERACTIVE" != "true" ]; then
+        auth_region=$(prompt_with_default "Region for authentication" "$auth_region")
     fi
-    
+
+    # Allow forcing re-auth / new profile
+    if [ "$FORCE_REAUTH" = "true" ]; then
+        new_profile=$(prompt_with_default "Enter new profile name to create/use" "NEW_PROFILE")
+        print_status "Starting interactive session authenticate for profile '$new_profile'..."
+
+        print_status "Using region '$auth_region' for authentication"
+        local auth_out
+        if is_wsl; then
+            auth_out=$(oci session authenticate --no-browser --profile-name "$new_profile" --region "$auth_region" --session-expiration-in-minutes 60 2>&1) || {
+                echo "$auth_out" >&2
+                if echo "$auth_out" | grep -i -E "config file.*is invalid|Config Errors|user .*missing" >/dev/null 2>&1; then
+                    print_warning "OCI CLI reports the config file is invalid or missing required fields. Offering repair options..."
+                    existing_config_invalid=1
+                else
+                    print_error "Authentication failed"
+                    return 1
+                fi
+            }
+            if [ "$existing_config_invalid" -ne 1 ]; then
+                echo "$auth_out"
+                local url
+                url=$(echo "$auth_out" | grep -Eo 'https://[^ ]+' | head -1 || true)
+                if [ -n "$url" ]; then
+                    print_status "Opening browser for login URL (WSL)..."
+                    open_url_best_effort "$url" || true
+                fi
+            fi
+        else
+            if ! oci session authenticate --profile-name "$new_profile" --region "$auth_region" --session-expiration-in-minutes 60; then
+                print_error "Browser authentication failed or was cancelled"
+                return 1
+            fi
+        fi
+
+        print_status "Authentication for profile '$new_profile' completed. Updating OCI_PROFILE to use it."
+        OCI_PROFILE="$new_profile"
+        auth_method="security_token"
+
+        if [ "$existing_config_invalid" -eq 1 ]; then
+            # Run the same automatic delete and recreate flow
+            print_warning "Detected invalid or incomplete OCI config file during forced re-auth - AUTOMATICALLY DELETING AND FORCING FRESH AUTHENTICATION"
+
+            # IMMEDIATE DELETE: Remove corrupted config without prompting
+            if [ -f "$OCI_CONFIG_FILE" ]; then
+                print_status "Backing up corrupted config to $OCI_CONFIG_FILE.corrupted.$(date +%Y%m%d_%H%M%S)"
+                cp "$OCI_CONFIG_FILE" "$OCI_CONFIG_FILE.corrupted.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+                print_status "Forcibly deleting corrupted config file: $OCI_CONFIG_FILE"
+                rm -f "$OCI_CONFIG_FILE"
+            fi
+            
+            # Delete any temp config files to start completely fresh
+            rm -f "$HOME/.oci/config.session_auth" 2>/dev/null || true
+            
+            # Create completely new profile with session auth
+            new_profile="DEFAULT"
+            print_status "Creating fresh OCI configuration with browser-based authentication for profile '$new_profile'..."
+            print_status "This will open your browser to log into Oracle Cloud."
+            print_status ""
+            print_status "Using region '$auth_region' for authentication"
+            print_status ""
+            
+            # Use the default config location (let OCI CLI create it fresh)
+            OCI_CONFIG_FILE="$HOME/.oci/config"
+            OCI_PROFILE="$new_profile"
+            unset OCI_CLI_CONFIG_FILE
+            
+            if is_wsl; then
+                if auth_out=$(oci session authenticate --no-browser --profile-name "$new_profile" --region "$auth_region" --session-expiration-in-minutes 60 2>&1); then
+                    echo "$auth_out"
+                    local url
+                    url=$(echo "$auth_out" | grep -Eo 'https://[^ ]+' | head -1 || true)
+                    if [ -n "$url" ]; then
+                        print_status "Opening browser for login URL (WSL)..."
+                        open_url_best_effort "$url" || true
+                        print_status ""
+                        print_status "After completing browser authentication, press Enter to continue..."
+                        read -r
+                    fi
+                    OCI_PROFILE="$new_profile"
+                    auth_method="security_token"
+                    if test_oci_connectivity; then
+                        print_success "Fresh session authentication succeeded for profile '$new_profile'"
+                        return 0
+                    else
+                        print_warning "Session auth completed but connectivity test failed"
+                    fi
+                else
+                    echo "$auth_out" >&2
+                    print_error "Browser-based authentication failed. Please verify your Oracle Cloud credentials and try again."
+                    return 1
+                fi
+            else
+                if oci session authenticate --profile-name "$new_profile" --region "$auth_region" --session-expiration-in-minutes 60; then
+                    OCI_PROFILE="$new_profile"
+                    auth_method="security_token"
+                    if test_oci_connectivity; then
+                        print_success "Fresh session authentication succeeded for profile '$new_profile'"
+                        return 0
+                    else
+                        print_warning "Session auth completed but connectivity test failed"
+                    fi
+                else
+                    print_error "Browser-based authentication failed. Please verify your Oracle Cloud credentials and try again."
+                    return 1
+                fi
+            fi
+        fi
+
+        if test_oci_connectivity; then
+            print_success "OCI authentication configured successfully for profile '$new_profile'"
+            return 0
+        else
+            print_warning "Authentication succeeded but connectivity test failed for profile '$new_profile'"
+        fi
+    else
+        # If existing config was invalid, automatically fix it
+        if [ "$existing_config_invalid" -eq 1 ]; then
+            print_warning "Detected invalid or incomplete OCI config file - AUTOMATICALLY DELETING AND FORCING FRESH AUTHENTICATION"
+            
+            # IMMEDIATE DELETE: Remove corrupted config without prompting
+            if [ -f "$OCI_CONFIG_FILE" ]; then
+                print_status "Backing up corrupted config to $OCI_CONFIG_FILE.corrupted.$(date +%Y%m%d_%H%M%S)"
+                cp "$OCI_CONFIG_FILE" "$OCI_CONFIG_FILE.corrupted.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+                print_status "Forcibly deleting corrupted config file: $OCI_CONFIG_FILE"
+                rm -f "$OCI_CONFIG_FILE"
+            fi
+            
+            # Delete any temp config files to start completely fresh
+            rm -f "$HOME/.oci/config.session_auth" 2>/dev/null || true
+            
+            # Create completely new profile with session auth
+            new_profile="DEFAULT"
+            print_status "Creating fresh OCI configuration with browser-based authentication for profile '$new_profile'..."
+            print_status "This will open your browser to log into Oracle Cloud."
+            print_status ""
+            print_status "Using region '$auth_region' for authentication"
+            print_status ""
+            
+            # Use the default config location (let OCI CLI create it fresh)
+            OCI_CONFIG_FILE="$HOME/.oci/config"
+            OCI_PROFILE="$new_profile"
+            unset OCI_CLI_CONFIG_FILE
+            
+            if is_wsl; then
+                if auth_out=$(oci session authenticate --no-browser --profile-name "$new_profile" --region "$auth_region" --session-expiration-in-minutes 60 2>&1); then
+                    echo "$auth_out"
+                    local url
+                    url=$(echo "$auth_out" | grep -Eo 'https://[^ ]+' | head -1 || true)
+                    if [ -n "$url" ]; then
+                        print_status "Opening browser for login URL (WSL)..."
+                        open_url_best_effort "$url" || true
+                        print_status ""
+                        print_status "After completing browser authentication, press Enter to continue..."
+                        read -r
+                    fi
+                    auth_method="security_token"
+                    if test_oci_connectivity; then
+                        print_success "Fresh session authentication succeeded for profile '$new_profile'"
+                        return 0
+                    else
+                        print_warning "Session auth completed but connectivity test failed"
+                    fi
+                else
+                    echo "$auth_out" >&2
+                    print_error "Browser-based authentication failed. Please verify your Oracle Cloud credentials and try again."
+                    return 1
+                fi
+            else
+                if oci session authenticate --profile-name "$new_profile" --region "$auth_region" --session-expiration-in-minutes 60; then
+                    auth_method="security_token"
+                    if test_oci_connectivity; then
+                        print_success "Fresh session authentication succeeded for profile '$new_profile'"
+                        return 0
+                    else
+                        print_warning "Session auth completed but connectivity test failed"
+                    fi
+                else
+                    print_error "Browser-based authentication failed. Please verify your Oracle Cloud credentials and try again."
+                    return 1
+                fi
+            fi
+        fi
+        # Interactive authenticate (may open browser)
+        print_status "Using profile '$OCI_PROFILE' for interactive session authenticate..."
+
+        print_status "Using region '$auth_region' for authentication"
+        if is_wsl; then
+            local auth_out
+            auth_out=$(oci session authenticate --no-browser --profile-name "$OCI_PROFILE" --region "$auth_region" --session-expiration-in-minutes 60 2>&1) || {
+                echo "$auth_out" >&2
+                if echo "$auth_out" | grep -i -E "config file.*is invalid|Config Errors|user .*missing" >/dev/null 2>&1; then
+                    print_warning "OCI CLI reports the config file is invalid or missing required fields. Offering repair options..."
+                    existing_config_invalid=1
+                else
+                    print_error "Authentication failed"
+                    return 1
+                fi
+            }
+            if [ "$existing_config_invalid" -ne 1 ]; then
+                echo "$auth_out"
+                local url
+                url=$(echo "$auth_out" | grep -Eo 'https://[^ ]+' | head -1 || true)
+                if [ -n "$url" ]; then
+                    print_status "Opening browser for login URL (WSL)..."
+                    open_url_best_effort "$url" || true
+                fi
+            fi
+        else
+            # Capture output so we can detect invalid-config errors and offer remediation
+            auth_out=$(oci session authenticate --profile-name "$OCI_PROFILE" --region "$auth_region" --session-expiration-in-minutes 60 2>&1) || {
+                echo "$auth_out" >&2
+                if echo "$auth_out" | grep -i -E "config file.*is invalid|Config Errors|user .*missing" >/dev/null 2>&1; then
+                    print_warning "OCI CLI reports the config file is invalid or missing required fields. Offering repair options..."
+                    existing_config_invalid=1
+                else
+                    print_error "Browser authentication failed or was cancelled"
+                    return 1
+                fi
+            }
+        fi
+
+        # SHARED REPAIR FLOW: runs for both WSL and non-WSL when existing_config_invalid is set
+        if [ "$existing_config_invalid" -eq 1 ]; then
+            print_warning "Detected invalid or incomplete OCI config file - AUTOMATICALLY DELETING AND FORCING FRESH AUTHENTICATION"
+            
+            # IMMEDIATE DELETE: Remove corrupted config without prompting
+            if [ -f "$OCI_CONFIG_FILE" ]; then
+                print_status "Backing up corrupted config to $OCI_CONFIG_FILE.corrupted.$(date +%Y%m%d_%H%M%S)"
+                cp "$OCI_CONFIG_FILE" "$OCI_CONFIG_FILE.corrupted.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+                print_status "Forcibly deleting corrupted config file: $OCI_CONFIG_FILE"
+                rm -f "$OCI_CONFIG_FILE"
+            fi
+            
+            # Delete any temp config files to start completely fresh
+            rm -f "$HOME/.oci/config.session_auth" 2>/dev/null || true
+            
+            # Create completely new profile with session auth
+            new_profile="DEFAULT"
+            print_status "Creating fresh OCI configuration with browser-based authentication for profile '$new_profile'..."
+            print_status "This will open your browser to log into Oracle Cloud."
+            print_status ""
+            print_status "Using region '$auth_region' for authentication"
+            print_status ""
+            
+            # Use the default config location (let OCI CLI create it fresh)
+            OCI_CONFIG_FILE="$HOME/.oci/config"
+            OCI_PROFILE="$new_profile"
+            unset OCI_CLI_CONFIG_FILE
+            
+            if is_wsl; then
+                if auth_out=$(oci session authenticate --no-browser --profile-name "$new_profile" --region "$auth_region" --session-expiration-in-minutes 60 2>&1); then
+                    echo "$auth_out"
+                    local url
+                    url=$(echo "$auth_out" | grep -Eo 'https://[^ ]+' | head -1 || true)
+                    if [ -n "$url" ]; then
+                        print_status "Opening browser for login URL (WSL)..."
+                        open_url_best_effort "$url" || true
+                        print_status ""
+                        print_status "After completing browser authentication, press Enter to continue..."
+                        read -r
+                    fi
+                    auth_method="security_token"
+                    if test_oci_connectivity; then
+                        print_success "Fresh session authentication succeeded for profile '$new_profile'"
+                        return 0
+                    else
+                        print_warning "Session auth completed but connectivity test failed"
+                    fi
+                else
+                    echo "$auth_out" >&2
+                    print_error "Browser-based authentication failed. Please verify your Oracle Cloud credentials and try again."
+                    return 1
+                fi
+            else
+                if oci session authenticate --profile-name "$new_profile" --region "$auth_region" --session-expiration-in-minutes 60; then
+                    auth_method="security_token"
+                    if test_oci_connectivity; then
+                        print_success "Fresh session authentication succeeded for profile '$new_profile'"
+                        return 0
+                    else
+                        print_warning "Session auth completed but connectivity test failed"
+                    fi
+                else
+                    print_error "Browser-based authentication failed. Please verify your Oracle Cloud credentials and try again."
+                    return 1
+                fi
+            fi
+        fi
+
+
+        # If we got here without returning, then authentication succeeded but connectivity might have issues
+        # Let's continue anyway since the auth was successful
+        auth_method="security_token"
+
+        # Verify the new configuration
+        if test_oci_connectivity; then
+            print_success "OCI authentication configured successfully"
+            return 0
+        fi
+    fi
+
     print_error "OCI configuration verification failed"
     return 1
 }
 
 test_oci_connectivity() {
-    print_debug "Testing OCI API connectivity..."
+    print_status "Testing OCI API connectivity..."
     
     # Method 1: List regions (simplest test)
+    print_status "Checking IAM region list (timeout ${OCI_CMD_TIMEOUT}s)..."
     if oci_cmd "iam region list" >/dev/null 2>&1; then
         print_debug "Connectivity test passed (region list)"
         return 0
+    else
+        print_warning "Region list query failed or timed out"
     fi
     
     # Method 2: Get tenancy info if we have it
     local test_tenancy
-    test_tenancy=$(grep -oP '(?<=tenancy=).*' ~/.oci/config 2>/dev/null | head -1)
+    test_tenancy=$(grep -oP '(?<=tenancy=).*' "$OCI_CONFIG_FILE" 2>/dev/null | head -1)
     
     if [ -n "$test_tenancy" ]; then
+        print_status "Checking IAM tenancy get (timeout ${OCI_CMD_TIMEOUT}s)..."
         if oci_cmd "iam tenancy get --tenancy-id $test_tenancy" >/dev/null 2>&1; then
             print_debug "Connectivity test passed (tenancy get)"
             return 0
+        else
+            print_warning "Tenancy get failed or timed out"
         fi
     fi
     
@@ -1257,6 +1792,8 @@ prompt_configuration() {
     echo "  1) Use existing instances (manage what's already deployed)"
     if [ "$has_existing_config" = "true" ]; then
         echo "  2) Use saved configuration from variables.tf"
+    else
+        echo "  2) Use saved configuration from variables.tf (not available)"
     fi
     echo "  3) Configure new instances (respecting Free Tier limits)"
     echo "  4) Maximum Free Tier configuration (use all available resources)"
@@ -1271,9 +1808,17 @@ prompt_configuration() {
             choice=1
             print_status "Non-interactive mode: Using existing instances"
         else
-            echo -n -e "${BLUE}Choose configuration (1-4): ${NC}"
-            read -r choice
-            choice=${choice:-1}
+            # Use prompt_with_default so the user sees the default inline (e.g. "[1]") as requested
+            raw_choice=$(prompt_with_default "Choose configuration (1-4)" "1")
+            # Normalize input (remove CR and trim whitespace)
+            raw_choice=$(echo "$raw_choice" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            # Validate numeric range
+            if [[ "$raw_choice" =~ ^[0-9]+$ ]] && [ "$raw_choice" -ge 1 ] && [ "$raw_choice" -le 4 ]; then
+                choice=$raw_choice
+            else
+                print_error "Please enter a number between 1 and 4 (received: '$raw_choice')"
+                continue
+            fi
         fi
         
         case $choice in
@@ -1366,24 +1911,11 @@ configure_custom_instances() {
     print_status "Custom instance configuration..."
     
     # AMD instances
-    while true; do
-        echo -n -e "${BLUE}Number of AMD instances (0-$AVAILABLE_AMD_INSTANCES): ${NC}"
-        read -r amd_micro_instance_count
-        amd_micro_instance_count=${amd_micro_instance_count:-0}
-        
-        if [[ "$amd_micro_instance_count" =~ ^[0-9]+$ ]] && \
-           [ "$amd_micro_instance_count" -ge 0 ] && \
-           [ "$amd_micro_instance_count" -le "$AVAILABLE_AMD_INSTANCES" ]; then
-            break
-        fi
-        print_error "Please enter a number between 0 and $AVAILABLE_AMD_INSTANCES"
-    done
+    amd_micro_instance_count=$(prompt_int_range "Number of AMD instances (0-$AVAILABLE_AMD_INSTANCES)" "0" "0" "$AVAILABLE_AMD_INSTANCES")
     
     amd_micro_hostnames=()
     if [ "$amd_micro_instance_count" -gt 0 ]; then
-        echo -n -e "${BLUE}AMD boot volume size (50-100 GB) [50]: ${NC}"
-        read -r amd_micro_boot_volume_size_gb
-        amd_micro_boot_volume_size_gb=${amd_micro_boot_volume_size_gb:-50}
+        amd_micro_boot_volume_size_gb=$(prompt_int_range "AMD boot volume size GB (50-100)" "50" "50" "100")
         
         for ((i=1; i<=amd_micro_instance_count; i++)); do
             echo -n -e "${BLUE}Hostname for AMD instance $i [amd-instance-$i]: ${NC}"
@@ -1397,18 +1929,7 @@ configure_custom_instances() {
     
     # ARM instances
     if [ -n "$ubuntu_arm_flex_image_ocid" ] && [ "$AVAILABLE_ARM_OCPUS" -gt 0 ]; then
-        while true; do
-            echo -n -e "${BLUE}Number of ARM instances (0-4): ${NC}"
-            read -r arm_flex_instance_count
-            arm_flex_instance_count=${arm_flex_instance_count:-1}
-            
-            if [[ "$arm_flex_instance_count" =~ ^[0-9]+$ ]] && \
-               [ "$arm_flex_instance_count" -ge 0 ] && \
-               [ "$arm_flex_instance_count" -le 4 ]; then
-                break
-            fi
-            print_error "Please enter a number between 0 and 4"
-        done
+        arm_flex_instance_count=$(prompt_int_range "Number of ARM instances (0-4)" "1" "0" "4")
         
         arm_flex_hostnames=()
         arm_flex_ocpus_per_instance=""
@@ -1427,25 +1948,19 @@ configure_custom_instances() {
             read -r hostname
             hostname=${hostname:-"arm-instance-$i"}
             arm_flex_hostnames+=("$hostname")
-            
-            echo -n -e "${BLUE}  OCPUs (1-$remaining_ocpus): ${NC}"
-            read -r ocpus
-            ocpus=${ocpus:-$remaining_ocpus}
+
+            ocpus=$(prompt_int_range "  OCPUs (1-$remaining_ocpus)" "$remaining_ocpus" "1" "$remaining_ocpus")
             arm_flex_ocpus_per_instance+="$ocpus "
             remaining_ocpus=$((remaining_ocpus - ocpus))
             
             local max_memory=$((ocpus * 6))  # 6GB per OCPU max
             [ $max_memory -gt $remaining_memory ] && max_memory=$remaining_memory
-            
-            echo -n -e "${BLUE}  Memory GB (1-$max_memory): ${NC}"
-            read -r memory
-            memory=${memory:-$max_memory}
+
+            memory=$(prompt_int_range "  Memory GB (1-$max_memory)" "$max_memory" "1" "$max_memory")
             arm_flex_memory_per_instance+="$memory "
             remaining_memory=$((remaining_memory - memory))
-            
-            echo -n -e "${BLUE}  Boot volume GB (50-200) [50]: ${NC}"
-            read -r boot
-            boot=${boot:-50}
+
+            boot=$(prompt_int_range "  Boot volume GB (50-200)" "50" "50" "200")
             arm_flex_boot_volume_size_gb+="$boot "
             
             arm_flex_block_volumes+=(0)
@@ -1780,7 +2295,7 @@ resource "oci_core_default_security_list" "main" {
     protocol    = "all"
   }
   
-  # SSH
+  # SSH (IPv4)
   ingress_security_rules {
     protocol = "6"
     source   = "0.0.0.0/0"
@@ -1789,8 +2304,17 @@ resource "oci_core_default_security_list" "main" {
       max = 22
     }
   }
+  # SSH (IPv6)
+  ingress_security_rules {
+    protocol = "6"
+    source   = "::/0"
+    tcp_options {
+      min = 22
+      max = 22
+    }
+  }
   
-  # HTTP
+  # HTTP (IPv4)
   ingress_security_rules {
     protocol = "6"
     source   = "0.0.0.0/0"
@@ -1799,8 +2323,17 @@ resource "oci_core_default_security_list" "main" {
       max = 80
     }
   }
+  # HTTP (IPv6)
+  ingress_security_rules {
+    protocol = "6"
+    source   = "::/0"
+    tcp_options {
+      min = 80
+      max = 80
+    }
+  }
   
-  # HTTPS
+  # HTTPS (IPv4)
   ingress_security_rules {
     protocol = "6"
     source   = "0.0.0.0/0"
@@ -1809,11 +2342,25 @@ resource "oci_core_default_security_list" "main" {
       max = 443
     }
   }
+  # HTTPS (IPv6)
+  ingress_security_rules {
+    protocol = "6"
+    source   = "::/0"
+    tcp_options {
+      min = 443
+      max = 443
+    }
+  }
   
-  # ICMP
+  # ICMP (IPv4)
   ingress_security_rules {
     protocol = "1"
     source   = "0.0.0.0/0"
+  }
+  # ICMP (IPv6)
+  ingress_security_rules {
+    protocol = "1"
+    source   = "::/0"
   }
 }
 
@@ -1848,6 +2395,7 @@ resource "oci_core_instance" "amd" {
     subnet_id        = oci_core_subnet.main.id
     display_name     = "${local.amd_micro_hostnames[count.index]}-vnic"
     assign_public_ip = true
+    assign_ipv6ip    = true
     hostname_label   = local.amd_micro_hostnames[count.index]
   }
   
@@ -1896,6 +2444,7 @@ resource "oci_core_instance" "arm" {
     subnet_id        = oci_core_subnet.main.id
     display_name     = "${local.arm_flex_hostnames[count.index]}-vnic"
     assign_public_ip = true
+    assign_ipv6ip    = true
     hostname_label   = local.arm_flex_hostnames[count.index]
   }
   
@@ -1927,6 +2476,49 @@ resource "oci_core_instance" "arm" {
 }
 
 # ============================================================================
+# PER-INSTANCE IPv6: Reserve an IPv6 for each instance VNIC
+# Docs: "Creates an IPv6 for the specified VNIC." and "lifetime: Ephemeral | Reserved" (OCI Terraform provider)
+# ============================================================================
+
+data "oci_core_vnic_attachments" "amd_vnics" {
+  count = local.amd_micro_instance_count
+  compartment_id = local.compartment_id
+  instance_id    = oci_core_instance.amd[count.index].id
+}
+
+resource "oci_core_ipv6" "amd_ipv6" {
+  count = local.amd_micro_instance_count
+  vnic_id = data.oci_core_vnic_attachments.amd_vnics[count.index].vnic_attachments[0].vnic_id
+  lifetime = "RESERVED"
+  subnet_id = oci_core_subnet.main.id
+  route_table_id = oci_core_default_route_table.main.id
+  display_name = "amd-${local.amd_micro_hostnames[count.index]}-ipv6"
+  freeform_tags = {
+    "Purpose" = "AlwaysFreeTier"
+    "Managed" = "Terraform"
+  }
+}
+
+data "oci_core_vnic_attachments" "arm_vnics" {
+  count = local.arm_flex_instance_count
+  compartment_id = local.compartment_id
+  instance_id    = oci_core_instance.arm[count.index].id
+}
+
+resource "oci_core_ipv6" "arm_ipv6" {
+  count = local.arm_flex_instance_count
+  vnic_id = data.oci_core_vnic_attachments.arm_vnics[count.index].vnic_attachments[0].vnic_id
+  lifetime = "RESERVED"
+  subnet_id = oci_core_subnet.main.id
+  route_table_id = oci_core_default_route_table.main.id
+  display_name = "arm-${local.arm_flex_hostnames[count.index]}-ipv6"
+  freeform_tags = {
+    "Purpose" = "AlwaysFreeTier"
+    "Managed" = "Terraform"
+  }
+}
+
+# ============================================================================
 # OUTPUTS
 # ============================================================================
 
@@ -1937,6 +2529,7 @@ output "amd_instances" {
       id         = oci_core_instance.amd[i].id
       public_ip  = oci_core_instance.amd[i].public_ip
       private_ip = oci_core_instance.amd[i].private_ip
+      ipv6       = oci_core_ipv6.amd_ipv6[i].ip_address
       state      = oci_core_instance.amd[i].state
       ssh        = "ssh -i ./ssh_keys/id_rsa ubuntu@${oci_core_instance.amd[i].public_ip}"
     }
@@ -1950,6 +2543,7 @@ output "arm_instances" {
       id         = oci_core_instance.arm[i].id
       public_ip  = oci_core_instance.arm[i].public_ip
       private_ip = oci_core_instance.arm[i].private_ip
+      ipv6       = oci_core_ipv6.arm_ipv6[i].ip_address
       state      = oci_core_instance.arm[i].state
       ocpus      = local.arm_flex_ocpus_per_instance[i]
       memory_gb  = local.arm_flex_memory_per_instance[i]
@@ -2438,10 +3032,10 @@ main() {
     
     # Phase 7: Terraform management
     while true; do
-        terraform_menu
-        result=$?
-        [ $result -eq 0 ] && break
-        
+        if terraform_menu; then
+            break
+        fi
+
         # Reconfigure requested
         prompt_configuration
         create_terraform_files

@@ -111,7 +111,7 @@ oracle-cloud-terraform/
 ```bash
 git clone https://github.com/bolabaden/cloudcradle.git
 cd cloudcradle
-bash scripts/setup_oci_terraform.sh          # Installs and configures OCI CLI, auths through the browser, sets up a python venv
+./setup_oci_terraform.sh                    # Installs and configures OCI CLI, auths through the browser, sets up a python venv
 # [SUCCESS] All setup verification checks passed!
 # [SUCCESS] ==================== SETUP COMPLETE ====================
 # [SUCCESS] OCI Terraform setup completed successfully!
@@ -128,6 +128,46 @@ bash scripts/setup_oci_terraform.sh          # Installs and configures OCI CLI, 
 # [INFO]   - ./ssh_keys/id_rsa.pub (SSH public key)
 # [INFO]   - ./variables.tf (Terraform variables)
 # [INFO] =========================================================
+```
+
+### Switching OCI accounts / profiles
+
+OCI CLI authentication is stored in `~/.oci/config` using named *profiles* (e.g. `DEFAULT`, `MYACCOUNT`, etc). CloudCradle will **reuse an existing working profile by default**.
+
+If you want to log in as a different OCI account (or just create a separate profile), run:
+
+```bash
+# Forces browser login and prompts for a new profile name
+FORCE_REAUTH=true ./setup_oci_terraform.sh
+```
+
+To use a specific existing profile without re-authenticating:
+
+```bash
+OCI_PROFILE=MYPROFILE ./setup_oci_terraform.sh
+```
+
+About the “choose a region” and “create a profile” prompts:
+- `oci session authenticate` requires a `--region`. If your profile already has a region configured, CloudCradle will reuse it; otherwise, OCI CLI will prompt you to choose one.
+- `oci session authenticate` is designed to *create/update a session profile*. CloudCradle passes the profile name automatically (so you should not be forced to re-type it), but OCI will still prompt if required values are missing.
+
+To skip the region selection menu during browser auth:
+
+```bash
+OCI_AUTH_REGION=us-chicago-1 ./setup_oci_terraform.sh
+```
+
+Session tokens are time-bounded by OCI (commonly up to ~60 minutes). CloudCradle will attempt `oci session refresh` when it detects an expired session; you can also refresh manually:
+
+```bash
+oci session refresh --profile MYPROFILE
+```
+
+To “log out” / force a clean slate, you can back up and remove the OCI config and sessions:
+
+```bash
+mv ~/.oci/config ~/.oci/config.bak
+rm -rf ~/.oci/sessions
 ```
 
 ### Helper scripts
