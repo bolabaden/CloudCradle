@@ -3,6 +3,12 @@
 .terraform/
 terraform.tfstate*
 tfplan
+*.tfplan
+
+# Backend files (may contain credentials) - do not commit
+backend.tf
+backend.tf.*
+backend/*.tf
 
 # Python virtual environment
 .venv

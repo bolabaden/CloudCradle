@@ -1,29 +1,107 @@
 #!/bin/bash
 
 # Oracle Cloud Infrastructure (OCI) Terraform Setup Script
-# This script automates the setup of OCI CLI and fetches all required variables for Terraform
+# Idempotent, comprehensive implementation for Always Free Tier management
 #
 # Usage:
 #   Interactive mode:        ./setup_oci_terraform.sh
 #   Non-interactive mode:    NON_INTERACTIVE=true AUTO_USE_EXISTING=true AUTO_DEPLOY=true ./setup_oci_terraform.sh
 #   Use existing config:     AUTO_USE_EXISTING=true ./setup_oci_terraform.sh
 #   Auto deploy only:        AUTO_DEPLOY=true ./setup_oci_terraform.sh
+#   Skip to deploy:          SKIP_CONFIG=true ./setup_oci_terraform.sh
+#
+# Key features:
+#   - Completely idempotent: safe to run multiple times
+#   - Comprehensive resource detection before any deployment
+#   - Strict Free Tier limit validation
+#   - Robust existing resource import
 
-set -e  # Exit on any error
+set -euo pipefail
+
+# ============================================================================
+# CONFIGURATION AND CONSTANTS
+# ============================================================================
 
 # Non-interactive mode support
 NON_INTERACTIVE=${NON_INTERACTIVE:-false}
 AUTO_USE_EXISTING=${AUTO_USE_EXISTING:-false}
 AUTO_DEPLOY=${AUTO_DEPLOY:-false}
+SKIP_CONFIG=${SKIP_CONFIG:-false}
+DEBUG=${DEBUG:-false}
+
+# Optional Terraform remote backend (set to 'oci' to use OCI Object Storage S3-compatible backend)
+TF_BACKEND=${TF_BACKEND:-local}                # values: local | oci
+TF_BACKEND_BUCKET=${TF_BACKEND_BUCKET:-""}   # Bucket name for terraform state
+TF_BACKEND_CREATE_BUCKET=${TF_BACKEND_CREATE_BUCKET:-false}
+TF_BACKEND_REGION=${TF_BACKEND_REGION:-""}
+TF_BACKEND_ENDPOINT=${TF_BACKEND_ENDPOINT:-""}
+TF_BACKEND_STATE_KEY=${TF_BACKEND_STATE_KEY:-"terraform.tfstate"}
+TF_BACKEND_ACCESS_KEY=${TF_BACKEND_ACCESS_KEY:-""}   # (optional) S3 access key
+TF_BACKEND_SECRET_KEY=${TF_BACKEND_SECRET_KEY:-""}   # (optional) S3 secret key
+
+# Retry/backoff settings for transient errors like 'Out of Capacity'
+RETRY_MAX_ATTEMPTS=${RETRY_MAX_ATTEMPTS:-8}
+RETRY_BASE_DELAY=${RETRY_BASE_DELAY:-15}  # seconds
+
+
+# Oracle Free Tier Limits (as of 2025)
+readonly FREE_TIER_MAX_AMD_INSTANCES=2
+readonly FREE_TIER_AMD_SHAPE="VM.Standard.E2.1.Micro"
+readonly FREE_TIER_MAX_ARM_OCPUS=4
+readonly FREE_TIER_MAX_ARM_MEMORY_GB=24
+readonly FREE_TIER_ARM_SHAPE="VM.Standard.A1.Flex"
+readonly FREE_TIER_MAX_STORAGE_GB=200
+readonly FREE_TIER_MIN_BOOT_VOLUME_GB=47
+readonly FREE_TIER_MAX_ARM_INSTANCES=4
+readonly FREE_TIER_MAX_VCNS=2
 
 # Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly MAGENTA='\033[0;35m'
+readonly BOLD='\033[1m'
+readonly NC='\033[0m' # No Color
 
-# Function to print colored output
+# Global state tracking
+declare -g tenancy_ocid=""
+declare -g user_ocid=""
+declare -g region=""
+declare -g fingerprint=""
+declare -g availability_domain=""
+declare -g ubuntu_image_ocid=""
+declare -g ubuntu_arm_flex_image_ocid=""
+declare -g ssh_public_key=""
+declare -g auth_method="security_token"
+
+# Existing resource tracking (populated by inventory functions)
+declare -gA EXISTING_VCNS=()
+declare -gA EXISTING_SUBNETS=()
+declare -gA EXISTING_INTERNET_GATEWAYS=()
+declare -gA EXISTING_ROUTE_TABLES=()
+declare -gA EXISTING_SECURITY_LISTS=()
+declare -gA EXISTING_AMD_INSTANCES=()
+declare -gA EXISTING_ARM_INSTANCES=()
+declare -gA EXISTING_BOOT_VOLUMES=()
+declare -gA EXISTING_BLOCK_VOLUMES=()
+
+# Instance configuration
+declare -g amd_micro_instance_count=0
+declare -g amd_micro_boot_volume_size_gb=50
+declare -g arm_flex_instance_count=0
+declare -g arm_flex_ocpus_per_instance=""
+declare -g arm_flex_memory_per_instance=""
+declare -g arm_flex_boot_volume_size_gb=""
+declare -ga arm_flex_block_volumes=()
+declare -ga amd_micro_hostnames=()
+declare -ga arm_flex_hostnames=()
+
+# ============================================================================
+# LOGGING FUNCTIONS
+# ============================================================================
+
 print_status() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
@@ -40,2238 +118,1418 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Function to check if command exists
+print_debug() {
+    if [ "$DEBUG" = "true" ]; then
+        echo -e "${CYAN}[DEBUG]${NC} $1"
+    fi
+}
+
+print_header() {
+    echo ""
+    echo -e "${BOLD}${MAGENTA}════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${MAGENTA}  $1${NC}"
+    echo -e "${BOLD}${MAGENTA}════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+}
+
+print_subheader() {
+    echo ""
+    echo -e "${BOLD}${CYAN}── $1 ──${NC}"
+    echo ""
+}
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# Function to install OCI CLI
+# Run OCI command with proper authentication handling
+oci_cmd() {
+    local cmd="$*"
+    local result=""
+    local exit_code=0
+    
+    # Try with security_token first if that's our auth method
+    if [ "$auth_method" = "security_token" ]; then
+        result=$(eval "oci $cmd --auth security_token" 2>/dev/null) && exit_code=0 || exit_code=$?
+        if [ $exit_code -eq 0 ] && [ -n "$result" ]; then
+            echo "$result"
+            return 0
+        fi
+    fi
+    
+    # Fallback to default auth
+    result=$(eval "oci $cmd" 2>/dev/null) && exit_code=0 || exit_code=$?
+    if [ $exit_code -eq 0 ]; then
+        echo "$result"
+        return 0
+    fi
+    
+    # Try with session_token
+    result=$(eval "oci $cmd --auth session_token" 2>/dev/null) && exit_code=0 || exit_code=$?
+    if [ $exit_code -eq 0 ]; then
+        echo "$result"
+        return 0
+    fi
+    
+    return 1
+}
+
+# Safe JSON parsing with jq
+safe_jq() {
+    local json="$1"
+    local query="$2"
+    local default="${3:-}"
+    
+    if [ -z "$json" ] || [ "$json" = "null" ]; then
+        echo "$default"
+        return
+    fi
+    
+    local result
+    result=$(echo "$json" | jq -r "$query" 2>/dev/null) || result="$default"
+    
+    if [ "$result" = "null" ] || [ -z "$result" ]; then
+        echo "$default"
+    else
+        echo "$result"
+    fi
+}
+
+# Run a command with retry/backoff, detect Out-of-Capacity signals
+retry_with_backoff() {
+    local cmd="$*"
+    local attempt=1
+    local rc=1
+    local out
+
+    while [ "$attempt" -le "$RETRY_MAX_ATTEMPTS" ]; do
+        print_status "Attempt $attempt/$RETRY_MAX_ATTEMPTS: $cmd"
+        out=$(eval "$cmd" 2>&1) && rc=0 || rc=$?
+
+        if [ $rc -eq 0 ]; then
+            echo "$out"
+            return 0
+        fi
+
+        # Detect Out-of-Capacity patterns
+        if echo "$out" | grep -i -E "out of capacity|out of host capacity|OutOfCapacity|OutOfHostCapacity" >/dev/null 2>&1; then
+            print_warning "Detected 'Out of Capacity' condition (attempt $attempt)."
+            # If we've exhausted attempts, bail
+        else
+            print_warning "Command failed (exit $rc)."
+        fi
+
+        local sleep_time=$(( RETRY_BASE_DELAY * (2 ** (attempt - 1)) ))
+        print_status "Retrying in ${sleep_time}s..."
+        sleep $sleep_time
+        attempt=$((attempt + 1))
+    done
+
+    print_error "Command failed after $RETRY_MAX_ATTEMPTS attempts"
+    echo "$out"
+    return $rc
+}
+
+# A simpler wrapper that returns true/false and sets OUT_OF_CAPACITY_DETECTED=1 when detected
+run_cmd_with_retries_and_check() {
+    local cmd="$*"
+    local out
+    # shellcheck disable=SC2034  # OUT_OF_CAPACITY_DETECTED is set for callers to inspect
+    OUT_OF_CAPACITY_DETECTED=0
+
+    out=$(retry_with_backoff "$cmd") || true
+    if echo "$out" | grep -i -E "out of capacity|out of host capacity|OutOfCapacity|OutOfHostCapacity" >/dev/null 2>&1; then
+        # shellcheck disable=SC2034  # exported flag for callers/tests
+        OUT_OF_CAPACITY_DETECTED=1
+    fi
+
+    # Return success if last command succeeded
+    grep -q "^\{" <<< "$out" 2>/dev/null || true
+    # We cannot rely on JSON only; instead rely on previous command exit status from retry_with_backoff
+    return $?
+}
+
+# Automatically re-run terraform apply until success on 'Out of Capacity', with backoff
+out_of_capacity_auto_apply() {
+    print_status "Auto-retrying terraform apply until success or max attempts (${RETRY_MAX_ATTEMPTS})..."
+    local attempt=1
+    local rc=1
+    local out
+
+    while [ "$attempt" -le "$RETRY_MAX_ATTEMPTS" ]; do
+        print_status "Apply attempt $attempt/$RETRY_MAX_ATTEMPTS"
+        out=$(terraform apply -input=false tfplan 2>&1) && rc=0 || rc=$?
+
+        if [ $rc -eq 0 ]; then
+            print_success "terraform apply succeeded"
+            return 0
+        fi
+
+        if echo "$out" | grep -i -E "out of capacity|out of host capacity|OutOfCapacity|OutOfHostCapacity" >/dev/null 2>&1; then
+            print_warning "Apply failed with 'Out of Capacity' - will retry"
+        else
+            print_error "terraform apply failed with non-retryable error"
+            echo "$out"
+            return $rc
+        fi
+
+        local sleep_time=$(( RETRY_BASE_DELAY * (2 ** (attempt - 1)) ))
+        print_status "Waiting ${sleep_time}s before retrying..."
+        sleep $sleep_time
+        attempt=$((attempt + 1))
+    done
+
+    print_error "terraform apply did not succeed after $RETRY_MAX_ATTEMPTS attempts"
+    echo "$out"
+    return 1
+}
+
+# Create an OCI Object Storage bucket (S3-compatible) for remote TF state if requested
+create_s3_backend_bucket() {
+    local bucket_name="$1"
+    if [ -z "$bucket_name" ]; then
+        print_error "Bucket name is empty"
+        return 1
+    fi
+
+    print_status "Creating/checking OCI Object Storage bucket: $bucket_name"
+
+    local ns
+    ns=$(oci_cmd "os ns get --query 'data' --raw-output" 2>/dev/null) || ns=""
+    if [ -z "$ns" ]; then
+        print_error "Failed to determine Object Storage namespace"
+        return 1
+    fi
+
+    # Check if bucket exists
+    if oci_cmd "os bucket get --namespace-name $ns --bucket-name $bucket_name" >/dev/null 2>&1; then
+        print_status "Bucket $bucket_name already exists in namespace $ns"
+        return 0
+    fi
+
+    if oci_cmd "os bucket create --namespace-name $ns --compartment-id $tenancy_ocid --name $bucket_name --is-versioning-enabled true" >/dev/null 2>&1; then
+        print_success "Created bucket $bucket_name in namespace $ns"
+        return 0
+    fi
+
+    print_error "Failed to create bucket $bucket_name"
+    return 1
+}
+
+# Configure terraform backend if TF_BACKEND=oci
+configure_terraform_backend() {
+    if [ "$TF_BACKEND" != "oci" ]; then
+        return 0
+    fi
+
+    if [ -z "$TF_BACKEND_BUCKET" ]; then
+        print_error "TF_BACKEND is 'oci' but TF_BACKEND_BUCKET is not set"
+        return 1
+    fi
+
+    TF_BACKEND_REGION=${TF_BACKEND_REGION:-$region}
+    TF_BACKEND_ENDPOINT=${TF_BACKEND_ENDPOINT:-"https://objectstorage.${TF_BACKEND_REGION}.oraclecloud.com"}
+
+    if [ "$TF_BACKEND_CREATE_BUCKET" = "true" ]; then
+        create_s3_backend_bucket "$TF_BACKEND_BUCKET" || return 1
+    fi
+
+    # Write backend override (sensitive; keep out of VCS)
+    print_status "Writing backend.tf (do not commit -- contains sensitive values)"
+    cat > backend.tf <<EOF
+terraform {
+  backend "s3" {
+    bucket     = "$TF_BACKEND_BUCKET"
+    key        = "$TF_BACKEND_STATE_KEY"
+    region     = "$TF_BACKEND_REGION"
+    endpoint   = "$TF_BACKEND_ENDPOINT"
+    access_key = "$TF_BACKEND_ACCESS_KEY"
+    secret_key = "$TF_BACKEND_SECRET_KEY"
+    skip_credentials_validation = true
+    skip_region_validation = true
+    skip_metadata_api_check = true
+    force_path_style = true
+  }
+}
+EOF
+    print_warning "backend.tf written - ensure this file is in .gitignore (contains credentials if provided)"
+}
+
+# Confirm action with user
+confirm_action() {
+    local prompt="$1"
+    local default="${2:-N}"
+    
+    if [ "$NON_INTERACTIVE" = "true" ]; then
+        [ "$default" = "Y" ] && return 0 || return 1
+    fi
+    
+    local yn_prompt
+    if [ "$default" = "Y" ]; then
+        yn_prompt="[Y/n]"
+    else
+        yn_prompt="[y/N]"
+    fi
+    
+    echo -n -e "${BLUE}$prompt $yn_prompt: ${NC}"
+    read -r response
+    response=${response:-$default}
+    
+    [[ "$response" =~ ^[Yy]$ ]]
+}
+
+# ============================================================================
+# INSTALLATION FUNCTIONS
+# ============================================================================
+
+install_prerequisites() {
+    print_subheader "Installing Prerequisites"
+    
+    local packages_to_install=()
+    
+    # Check for required commands
+    if ! command_exists jq; then
+        packages_to_install+=("jq")
+    fi
+    if ! command_exists curl; then
+        packages_to_install+=("curl")
+    fi
+    if ! command_exists unzip; then
+        packages_to_install+=("unzip")
+    fi
+    
+    if [ ${#packages_to_install[@]} -gt 0 ]; then
+        print_status "Installing required packages: ${packages_to_install[*]}"
+        if command_exists apt-get; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq "${packages_to_install[@]}"
+        elif command_exists yum; then
+            sudo yum install -y -q "${packages_to_install[@]}"
+        elif command_exists dnf; then
+            sudo dnf install -y -q "${packages_to_install[@]}"
+        else
+            print_error "Cannot install packages: no supported package manager found"
+            return 1
+        fi
+    fi
+    
+    # Verify all required commands exist
+    local required_commands=("jq" "openssl" "ssh-keygen" "curl")
+    for cmd in "${required_commands[@]}"; do
+        if ! command_exists "$cmd"; then
+            print_error "Required command '$cmd' is not available"
+            return 1
+        fi
+    done
+    
+    print_success "All prerequisites installed"
+}
+
 install_oci_cli() {
+    print_subheader "OCI CLI Setup"
+    
+    # Check if OCI CLI is already installed and working
+    if command_exists oci; then
+        local version
+        version=$(oci --version 2>/dev/null | head -1) || version="unknown"
+        print_status "OCI CLI already installed: $version"
+        return 0
+    fi
+    
     print_status "Installing OCI CLI..."
     
     # Check if Python is installed
     if ! command_exists python3; then
-        print_status "Python 3 not found. Installing Python 3..."
-        sudo apt-get update
-        sudo apt-get install -y python3 python3-venv python3-pip
+        print_status "Installing Python 3..."
+        if command_exists apt-get; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq python3 python3-venv python3-pip
+        elif command_exists yum; then
+            sudo yum install -y -q python3 python3-pip
+        fi
     fi
     
-    # Create a virtual environment for OCI CLI to avoid externally-managed-environment errors
-    if [ ! -d ".venv" ]; then
-        print_status "Creating Python virtual environment for OCI CLI..."
-        python3 -m venv .venv
+    # Create virtual environment for OCI CLI
+    local venv_dir="$PWD/.venv"
+    if [ ! -d "$venv_dir" ]; then
+        print_status "Creating Python virtual environment..."
+        python3 -m venv "$venv_dir"
     fi
     
-    source .venv/bin/activate
+    # Activate and install OCI CLI
+    # shellcheck source=/dev/null
+    # shellcheck disable=SC1091
+    source "$venv_dir/bin/activate"
     
-    # Install OCI CLI in the virtual environment
     print_status "Installing OCI CLI in virtual environment..."
-    pip install --upgrade pip
-    pip install oci-cli
+    pip install --upgrade pip --quiet
+    pip install oci-cli --quiet
     
-    # Add the virtual environment activation to .bashrc for future use
-    if ! grep -q "source $(pwd)/.venv/bin/activate" ~/.bashrc; then
-        echo "# OCI CLI virtual environment" >> ~/.bashrc
-        echo "source $(pwd)/.venv/bin/activate" >> ~/.bashrc
+    # Add activation to bashrc if not already present
+    local activation_line="source $venv_dir/bin/activate"
+    if ! grep -qF "$activation_line" ~/.bashrc 2>/dev/null; then
+        { echo ""; echo "# OCI CLI virtual environment"; echo "$activation_line"; } >> ~/.bashrc
     fi
     
-    print_success "OCI CLI installed successfully."
+    print_success "OCI CLI installed successfully"
 }
 
-# Function to setup OCI CLI config automatically
-setup_oci_config() {
-    print_status "Setting up OCI CLI configuration..."
-    
-    # Create .oci directory if it doesn't exist
-    mkdir -p ~/.oci
-    
-    if [ ! -f ~/.oci/config ]; then
-        print_status "No existing OCI config found. Setting up new configuration..."
-        
-        # Use browser-based authentication instead of manual API key setup
-        print_status "Setting up browser-based authentication..."
-        print_status "This will open a browser window for you to log in to Oracle Cloud."
-        print_status "After login, the CLI will automatically configure authentication."
-        
-        # Run the session authenticate command
-        if ! oci session authenticate; then
-            print_error "Browser authentication failed. Please try again."
-            exit 1
-        fi
-        
-        print_success "Browser authentication completed successfully!"
-        
-        # Test the configuration
-        print_status "Testing OCI CLI configuration..."
-        if ! test_oci_connectivity; then
-            print_error "OCI CLI configuration test failed. Please check your setup."
-            exit 1
-        fi
-        
-        print_success "OCI CLI configuration test passed!"
-        
-    else
-        print_status "Using existing OCI configuration at ~/.oci/config"
-        
-        # Test existing configuration
-        print_status "Testing existing OCI CLI configuration..."
-        if ! test_oci_connectivity; then
-            print_error "Existing OCI CLI configuration test failed."
-            print_status "Attempting to refresh authentication..."
-            
-            # Try to refresh the session
-            if oci session authenticate; then
-                print_success "Authentication refreshed successfully!"
-            else
-                print_error "Failed to refresh authentication. Please check your setup."
-                exit 1
-            fi
-        else
-            print_success "Existing OCI CLI configuration test passed!"
-        fi
-    fi
-}
-
-# Function to test OCI connectivity properly (updated for session tokens)
-test_oci_connectivity() {
-    # Try multiple methods to test connectivity with proper error handling
-    local tenancy_ocid=$(grep -oP '(?<=tenancy=).*' ~/.oci/config | head -1)
-    
-    print_status "Testing OCI API connectivity..."
-    
-    # Method 1: Try to list regions (most basic test)
-    print_status "  Testing region list access..."
-    if oci iam region list --auth session_token >/dev/null 2>&1; then
-        print_status "  ✓ Region list access successful"
-        return 0
-    elif oci iam region list >/dev/null 2>&1; then
-        print_status "  ✓ Region list access successful (fallback auth)"
-        return 0
-    fi
-    
-    # Method 2: Try to get tenancy information with session token
-    if [ -n "$tenancy_ocid" ]; then
-        print_status "  Testing tenancy access..."
-        if oci iam tenancy get --tenancy-id "$tenancy_ocid" --auth session_token >/dev/null 2>&1; then
-            print_status "  ✓ Tenancy access successful"
-            return 0
-        elif oci iam tenancy get --tenancy-id "$tenancy_ocid" >/dev/null 2>&1; then
-            print_status "  ✓ Tenancy access successful (fallback auth)"
-            return 0
-        fi
-    fi
-    
-    # Method 3: Try to get compartment information using tenancy as compartment
-    if [ -n "$tenancy_ocid" ]; then
-        print_status "  Testing compartment access..."
-        if oci iam compartment get --compartment-id "$tenancy_ocid" --auth session_token >/dev/null 2>&1; then
-            print_status "  ✓ Compartment access successful"
-            return 0
-        elif oci iam compartment get --compartment-id "$tenancy_ocid" >/dev/null 2>&1; then
-            print_status "  ✓ Compartment access successful (fallback auth)"
-            return 0
-        fi
-    fi
-    
-    # Method 4: Test with explicit endpoint and auth
-    print_status "  Testing with explicit authentication..."
-    local region=$(grep -oP '(?<=region=).*' ~/.oci/config | head -1)
-    echo "region: $region"
-    if [ -n "$region" ]; then
-        if oci iam region list --region "$region" --auth security_token; then
-            print_status "  ✓ Explicit region authentication successful"
-            return 0
-        fi
-    fi
-    
-    print_error "  ✗ All connectivity tests failed"
-    return 1
-}
-
-# Function to fetch fingerprint (updated for session tokens)
-fetch_fingerprint() {
-    print_status "Checking authentication method..."
-    
-    # For session token auth, we don't need a fingerprint
-    if grep -q "security_token_file" ~/.oci/config; then
-        print_status "Using session token authentication - no fingerprint needed"
-        fingerprint="session_token_auth"
-        return 0
-    fi
-    
-    # Fallback for API key auth if somehow still used
-    print_status "Using API key authentication - calculating fingerprint..."
-    fingerprint=$(openssl rsa -pubout -outform DER -in ~/.oci/oci_api_key.pem 2>/dev/null | openssl md5 -c | awk '{print $2}')
-    
-    if [ -z "$fingerprint" ]; then
-        print_error "Failed to calculate fingerprint"
-        return 1
-    fi
-    
-    print_success "Fingerprint: $fingerprint"
-    return 0
-}
-
-# Function to fetch user OCID
-fetch_user_ocid() {
-    print_status "Fetching user OCID..."
-    
-    # Extract user OCID from config file
-    user_ocid=$(grep -P '^\s*user\s*=\s*.*' ~/.oci/config | sed -E 's/^\s*user\s*=\s*//' | head -1)
-    
-    if [ -z "$user_ocid" ]; then
-        print_error "Failed to fetch user OCID from config. Please check your OCI CLI configuration."
-        return 1
-    fi
-    
-    print_success "User OCID: $user_ocid"
-    return 0
-}
-
-# Function to fetch tenancy OCID
-fetch_tenancy_ocid() {
-    print_status "Fetching tenancy OCID..."
-    
-    # Extract tenancy OCID from config file
-    tenancy_ocid=$(grep -oP '(?<=tenancy=).*' ~/.oci/config | head -1)
-    
-    if [ -z "$tenancy_ocid" ]; then
-        print_error "Failed to fetch tenancy OCID from config. Please check your OCI CLI configuration."
-        return 1
-    fi
-    
-    print_success "Tenancy OCID: $tenancy_ocid"
-    return 0
-}
-
-# Function to fetch region
-fetch_region() {
-    print_status "Fetching region..."
-    
-    # Extract region from config file
-    region=$(grep -oP '(?<=region=).*' ~/.oci/config | head -1)
-    
-    if [ -z "$region" ]; then
-        print_error "Failed to fetch region from config. Please check your OCI CLI configuration."
-        return 1
-    fi
-    
-    print_success "Region: $region"
-    return 0
-}
-
-# Function to fetch availability domains
-fetch_availability_domains() {
-    print_status "Fetching availability domains for region $region..."
-    
-    # Get all availability domains in the region using tenancy as compartment
-    availability_domains=$(oci iam availability-domain list --compartment-id "$tenancy_ocid" --query "data[].name" --raw-output --auth security_token)
-    echo "availability_domains: $availability_domains"
-    if [ -z "$availability_domains" ]; then
-        print_error "Failed to fetch availability domains. Please check your OCI CLI configuration."
-        return 1
-    fi
-    
-    # Parse the JSON array properly - the output is a JSON array
-    availability_domain=$(echo "$availability_domains" | jq -r '.[0]' 2>/dev/null || echo "$availability_domains" | head -1 | tr -d '[]"')
-    
-    if [ -z "$availability_domain" ] || [ "$availability_domain" == "null" ]; then
-        print_error "Failed to parse availability domain from response: $availability_domains"
-        return 1
-    fi
-    
-    print_success "Selected availability domain: $availability_domain"
-    return 0
-}
-
-# Function to fetch Ubuntu image OCID for the region dynamically
-fetch_region_images() {
-    print_status "Fetching Ubuntu image OCIDs for region $region..."
-    
-    # Fetch x86 (AMD64) Ubuntu image for E2.1.Micro instances
-    print_status "Fetching x86 Ubuntu image for AMD instances..."
-    ubuntu_image_ocid=$(oci compute image list \
-        --compartment-id "$tenancy_ocid" \
-        --operating-system "Canonical Ubuntu" \
-        --shape "VM.Standard.E2.1.Micro" \
-        --sort-by TIMECREATED \
-        --sort-order DESC \
-        --query "data[0].id" \
-        --raw-output \
-        --auth security_token)
-    
-    if [ -z "$ubuntu_image_ocid" ] || [ "$ubuntu_image_ocid" == "null" ]; then
-        print_error "Failed to fetch x86 Ubuntu image OCID. Please check available images in your region."
-        print_status "You can list available x86 images with: oci compute image list --compartment-id $tenancy_ocid --operating-system \"Canonical Ubuntu\" --shape VM.Standard.E2.1.Micro"
-        ubuntu_image_ocid=""  # Set to empty to disable x86 instances
-    else
-        # Get the ARM image details for verification
-        x86_image_details=$(oci compute image get --image-id "$ubuntu_image_ocid" --query "data.{name:\"display-name\",os:\"operating-system\",version:\"operating-system-version\"}" --auth security_token)
-        print_success "Found x86 Ubuntu image: $x86_image_details"
-        print_success "x86 Ubuntu image OCID: $ubuntu_image_ocid"
-    fi
-    
-    # Fetch ARM-based Ubuntu image for A1.Flex instances
-    print_status "Fetching ARM Ubuntu image OCID for A1.Flex instances..."
-    ubuntu_arm_flex_image_ocid=$(oci compute image list \
-        --compartment-id "$tenancy_ocid" \
-        --operating-system "Canonical Ubuntu" \
-        --shape "VM.Standard.A1.Flex" \
-        --sort-by TIMECREATED \
-        --sort-order DESC \
-        --query "data[0].id" \
-        --raw-output \
-        --auth security_token)
-    
-    if [ -z "$ubuntu_arm_flex_image_ocid" ] || [ "$ubuntu_arm_flex_image_ocid" == "null" ]; then
-        print_error "Failed to fetch ARM Ubuntu image OCID. ARM instances will be disabled."
-        print_warning "ARM instances require ARM-compatible images. Please check available ARM images in your region."
-        print_status "You can list available ARM images with: oci compute image list --compartment-id $tenancy_ocid --operating-system \"Canonical Ubuntu\" --shape VM.Standard.A1.Flex"
-        ubuntu_arm_flex_image_ocid=""  # Set to empty to disable ARM instances
-    else
-        # Get the ARM image details for verification
-        arm_image_details=$(oci compute image get --image-id "$ubuntu_arm_flex_image_ocid" --query "data.{name:\"display-name\",os:\"operating-system\",version:\"operating-system-version\"}" --auth security_token)
-        print_success "Found ARM Ubuntu image: $arm_image_details"
-        print_success "ARM Ubuntu image OCID: $ubuntu_arm_flex_image_ocid"
-    fi
-    
-    print_success "✓ Architecture validation passed: x86 and ARM images are different"
-    print_status "  x86 image: $ubuntu_image_ocid"
-    print_status "  ARM image: $ubuntu_arm_flex_image_ocid"
-    
-    return 0
-}
-
-# Function to generate SSH keys
-generate_ssh_keys() {
-    print_status "Generating SSH key pair for instance access..."
-    
-    ssh_dir="$PWD/ssh_keys"
-    mkdir -p "$ssh_dir"
-    
-    if [ ! -f "$ssh_dir/id_rsa" ]; then
-        ssh-keygen -t rsa -b 2048 -f "$ssh_dir/id_rsa" -N ""
-        chmod 600 "$ssh_dir/id_rsa"
-        chmod 644 "$ssh_dir/id_rsa.pub"
-        print_success "SSH key pair generated at $ssh_dir/id_rsa"
-    else
-        print_status "Using existing SSH key pair at $ssh_dir/id_rsa"
-    fi
-    
-    ssh_public_key=$(cat "$ssh_dir/id_rsa.pub")
-    print_success "SSH public key ready for instance deployment"
-    return 0
-}
-
-
-
-# Function to load existing ARM configuration from variables.tf
-load_existing_arm_config() {
-    if [ ! -f "variables.tf" ]; then
-        return 1
-    fi
-    
-    # Load existing ARM configuration
-    local existing_amd_count=$(grep -oP 'amd_micro_instance_count\s*=\s*\K[0-9]+' variables.tf | head -1)
-    local existing_amd_boot=$(grep -oP 'amd_micro_boot_volume_size_gb\s*=\s*\K[0-9]+' variables.tf | head -1)
-    local existing_arm_count=$(grep -oP 'arm_flex_instance_count\s*=\s*\K[0-9]+' variables.tf | head -1)
-    
-    # Load ARM instance arrays
-    local existing_arm_ocpus=$(grep -oP 'arm_flex_ocpus_per_instance\s*=\s*\[\K[^\]]+' variables.tf | head -1)
-    local existing_arm_memory=$(grep -oP 'arm_flex_memory_per_instance\s*=\s*\[\K[^\]]+' variables.tf | head -1)
-    local existing_arm_boot=$(grep -oP 'arm_flex_boot_volume_size_gb\s*=\s*\[\K[^\]]+' variables.tf | head -1)
-    local existing_arm_block=$(grep -oP 'arm_block_volume_sizes\s*=\s*\[\K[^\]]+' variables.tf | head -1)
-    
-    # Load hostnames
-    local existing_amd_hostnames=$(grep -oP 'amd_micro_hostnames\s*=\s*\[\K[^\]]+' variables.tf | head -1)
-    local existing_arm_hostnames=$(grep -oP 'arm_flex_hostnames\s*=\s*\[\K[^\]]+' variables.tf | head -1)
-    
-    if [ -n "$existing_arm_count" ] && [ "$existing_arm_count" -gt 0 ]; then
-        # Set global variables from existing config
-        amd_micro_instance_count=${existing_amd_count:-0}  # Default to 0 instead of 2
-        amd_micro_boot_volume_size_gb=${existing_amd_boot:-50}
-        arm_flex_instance_count=${existing_arm_count:-1}
-        
-        # Parse arrays
-        if [ -n "$existing_arm_ocpus" ]; then
-            arm_flex_ocpus_per_instance=$(echo "$existing_arm_ocpus" | tr -d '"' | tr ',' ' ')
-        else
-            arm_flex_ocpus_per_instance="4"
-        fi
-        
-        if [ -n "$existing_arm_memory" ]; then
-            arm_flex_memory_per_instance=$(echo "$existing_arm_memory" | tr -d '"' | tr ',' ' ')
-        else
-            arm_flex_memory_per_instance="24"
-        fi
-        
-        if [ -n "$existing_arm_boot" ]; then
-            arm_flex_boot_volume_size_gb=$(echo "$existing_arm_boot" | tr -d '"' | tr ',' ' ')
-        else
-            arm_flex_boot_volume_size_gb="160"
-        fi
-        
-        if [ -n "$existing_arm_block" ]; then
-            # Parse block volumes array
-            local block_array=($(echo "$existing_arm_block" | tr ',' ' '))
-            arm_flex_block_volumes=("${block_array[@]}")
-        else
-            arm_flex_block_volumes=(0)
-        fi
-        
-        # Parse hostnames - handle zero AMD instances properly
-        if [ -n "$existing_amd_hostnames" ] && [ "$amd_micro_instance_count" -gt 0 ]; then
-            local amd_hostname_array=($(echo "$existing_amd_hostnames" | tr -d '"' | tr ',' ' '))
-            amd_micro_hostnames=("${amd_hostname_array[@]}")
-        else
-            amd_micro_hostnames=()  # Empty array when no AMD instances
-        fi
-        
-        if [ -n "$existing_arm_hostnames" ]; then
-            local arm_hostname_array=($(echo "$existing_arm_hostnames" | tr -d '"' | tr ',' ' '))
-            arm_flex_hostnames=("${arm_hostname_array[@]}")
-        else
-            arm_flex_hostnames=("arm-instance-1")
-        fi
-        
-        return 0
-    fi
-    
-    return 1
-}
-
-# Function to prompt user for ARM instance configuration
-prompt_arm_flex_instance_config() {
-    print_status "Configuring ARM instance setup for Oracle Free Tier..."
-    print_status "Oracle Free Tier allows:"
-    print_status "  - 200GB TOTAL storage across ALL instances"
-    print_status "  - 2x AMD x86 micro instances (VM.Standard.E2.1.Micro): 1 OCPU, 1GB RAM each, min 50GB boot volume each (OCI requirement)"
-    print_status "  - 4 OCPUs + 24GB RAM total for ARM (Ampere) instances"
-    print_status "  - All boot volumes: minimum 50GB each (OCI requirement)"
-    print_status ""
-    print_status "Choose your configuration:"
-    print_status "  1) Default: 2x AMD micro (50GB each), 3x ARM (2+1+1 OCPU, 12+6+6GB RAM, 70/65/65GB boot)"
-    print_status "  2) Use existing configuration from variables.tf (if available)"
-    print_status "  3) Custom: Manually configure all values (number of AMD, ARM, OCPUs, RAM, boot, etc)"
-    print_status ""
-
-    while true; do
-        if [ "$AUTO_USE_EXISTING" = "true" ]; then
-            arm_flex_choice=2
-            print_status "Non-interactive mode: Using existing configuration (option 2)"
-        else
-            echo -n -e "${BLUE}Choose a configuration by number (1-3): ${NC}"
-            read -r arm_flex_choice
-            arm_flex_choice=${arm_flex_choice:-1}
-        fi
-        case $arm_flex_choice in
-            1)
-                # Default: 2x AMD micro (50GB each), 3x ARM (2+1+1 OCPU, 12+6+6GB RAM, 70/65/65GB boot)
-                amd_micro_instance_count=2
-                amd_micro_boot_volume_size_gb=50
-                arm_flex_instance_count=3
-                arm_flex_ocpus_per_instance="2 1 1"
-                arm_flex_memory_per_instance="12 6 6"
-                arm_flex_boot_volume_size_gb="70 65 65"
-                arm_flex_block_volumes=(0 0 0)
-                break
-                ;;
-            2)
-                # Use existing configuration from variables.tf
-                print_status "Loading existing configuration from variables.tf..."
-                if load_existing_arm_config; then
-                    print_success "Successfully loaded existing ARM configuration:"
-                    echo ""
-                    print_status "📊 CURRENT CONFIGURATION SUMMARY:"
-                    print_status "┌─────────────────────────────────────────────────────────────┐"
-                    print_status "│                    COMPUTE INSTANCES                       │"
-                    print_status "├─────────────────────────────────────────────────────────────┤"
-                    print_status "│ AMD x86 Instances: $amd_micro_instance_count instances                        │"
-                    if [ "$amd_micro_instance_count" -gt 0 ]; then
-                        print_status "│   • Shape: VM.Standard.E2.1.Micro (1 OCPU, 1GB RAM each)  │"
-                        print_status "│   • Boot Volume: ${amd_micro_boot_volume_size_gb}GB per instance                       │"
-                        print_status "│   • Total Storage: $((amd_micro_instance_count * amd_micro_boot_volume_size_gb))GB                                │"
-                        print_status "│   • Hostnames: ${amd_micro_hostnames[*]// /, }                    │"
-                    else
-                        print_status "│   • No AMD instances configured                            │"
-                    fi
-                    print_status "├─────────────────────────────────────────────────────────────┤"
-                    print_status "│ ARM Ampere Instances: $arm_flex_instance_count instances                      │"
-                    local ocpu_array=($arm_flex_ocpus_per_instance)
-                    local memory_array=($arm_flex_memory_per_instance)
-                    local boot_array=($arm_flex_boot_volume_size_gb)
-                    local total_arm_ocpus=0
-                    local total_arm_memory=0
-                    local total_arm_boot=0
-                    for ((i=0; i<${#ocpu_array[@]}; i++)); do
-                        local instance_num=$((i+1))
-                        local ocpu=${ocpu_array[$i]}
-                        local memory=${memory_array[$i]}
-                        local boot=${boot_array[$i]}
-                        local block=${arm_flex_block_volumes[$i]:-0}
-                        local hostname=${arm_flex_hostnames[$i]:-"arm-instance-$instance_num"}
-                        total_arm_ocpus=$((total_arm_ocpus + ocpu))
-                        total_arm_memory=$((total_arm_memory + memory))
-                        total_arm_boot=$((total_arm_boot + boot))
-                        print_status "│   Instance $instance_num ($hostname):                              │"
-                        print_status "│     • OCPUs: ${ocpu}, Memory: ${memory}GB, Boot: ${boot}GB, Block: ${block}GB       │"
-                    done
-                    print_status "│   • Total ARM Resources: ${total_arm_ocpus} OCPUs, ${total_arm_memory}GB RAM           │"
-                    print_status "├─────────────────────────────────────────────────────────────┤"
-                    print_status "│ STORAGE SUMMARY:                                           │"
-                    local total_boot=$((amd_micro_instance_count * amd_micro_boot_volume_size_gb + total_arm_boot))
-                    local total_block=0
-                    for block_vol in "${arm_flex_block_volumes[@]}"; do
-                        total_block=$((total_block + block_vol))
-                    done
-                    local total_storage=$((total_boot + total_block))
-                    print_status "│   • Total Boot Volumes: ${total_boot}GB                            │"
-                    print_status "│   • Total Block Volumes: ${total_block}GB                           │"
-                    print_status "│   • Total Storage Used: ${total_storage}GB / 200GB Free Tier       │"
-                    local remaining=$((200 - total_storage))
-                    if [ $remaining -gt 0 ]; then
-                        print_status "│   • Remaining Available: ${remaining}GB                         │"
-                    fi
-                    print_status "└─────────────────────────────────────────────────────────────┘"
-                    echo ""
-                    if [ "$NON_INTERACTIVE" = "true" ]; then
-                        use_existing="Y"
-                        print_status "Non-interactive mode: Using existing configuration"
-                    else
-                        echo -n -e "${BLUE}Use this existing configuration? (Y/n): ${NC}"
-                        read -r use_existing
-                        use_existing=${use_existing:-Y}
-                    fi
-                    if [[ "$use_existing" =~ ^[Yy]$ ]]; then
-                        print_success "✅ Using existing configuration - proceeding with setup"
-                        break
-                    else
-                        print_status "Please choose a different option."
-                        continue
-                    fi
-                else
-                    print_error "❌ No existing ARM configuration found in variables.tf or configuration is invalid."
-                    print_status "Please choose a different option (1-3)."
-                    continue
-                fi
-                ;;
-            3)
-                # Custom/manual entry
-                print_status "Custom/manual ARM instance configuration selected."
-                # Prompt for AMD micro instance count (0, 1, or 2)
-                while true; do
-                    if [ "$NON_INTERACTIVE" = "true" ]; then
-                        amd_micro_instance_count=0
-                        print_status "Non-interactive mode: Setting AMD instances to 0"
-                        break
-                    else
-                        echo -n -e "${BLUE}How many AMD x86 micro instances do you want? (0, 1, or 2) [default: 0]: ${NC}"
-                        read -r amd_micro_instance_count
-                        amd_micro_instance_count=${amd_micro_instance_count:-0}
-                    fi
-                    if [[ "$amd_micro_instance_count" =~ ^[0-2]$ ]]; then
-                        break
-                    else
-                        print_error "Please enter 0, 1, or 2."
-                    fi
-                done
-                if [ "$amd_micro_instance_count" -gt 0 ]; then
-                    while true; do
-                        if [ "$NON_INTERACTIVE" = "true" ]; then
-                            micro_boot=50
-                            break
-                        else
-                            echo -n -e "${BLUE}Enter boot volume size (GB) for each AMD micro instance [50-100, default 50]: ${NC}"
-                            read -r micro_boot
-                            micro_boot=${micro_boot:-50}
-                        fi
-                        if [[ "$micro_boot" =~ ^[0-9]+$ ]] && [ "$micro_boot" -ge 50 ] && [ "$micro_boot" -le 100 ]; then
-                            break
-                        else
-                            print_error "Please enter a number between 50 and 100 (OCI minimum is 50GB)."
-                        fi
-                    done
-                    amd_micro_boot_volume_size_gb=$micro_boot
-                else
-                    amd_micro_boot_volume_size_gb=50  # Default value even when count is 0
-                fi
-                
-                # Prompt for ARM instances
-                while true; do
-                    if [ "$NON_INTERACTIVE" = "true" ]; then
-                        arm_flex_instance_count=1
-                        print_status "Non-interactive mode: Setting ARM instances to 1"
-                        break
-                    else
-                        echo -n -e "${BLUE}Enter number of ARM instances [default: 1]: ${NC}"
-                        read -r arm_flex_instance_count
-                        arm_flex_instance_count=${arm_flex_instance_count:-1}
-                    fi
-                    if [[ "$arm_flex_instance_count" =~ ^[0-9]+$ ]] && [ "$arm_flex_instance_count" -ge 0 ]; then
-                        break
-                    else
-                        print_error "Please enter a valid number (0 or greater)."
-                    fi
-                done
-                
-                arm_flex_ocpus_per_instance=""
-                arm_flex_memory_per_instance=""
-                arm_flex_boot_volume_size_gb=""
-                arm_flex_block_volumes=()
-                
-                for ((i=1; i<=arm_flex_instance_count; i++)); do
-                    if [ "$NON_INTERACTIVE" = "true" ]; then
-                        ocpu=4
-                        ram=24
-                        boot=100
-                    else
-                        echo -n -e "${BLUE}Enter OCPUs for ARM instance $i [default: 4]: ${NC}"
-                        read -r ocpu
-                        ocpu=${ocpu:-4}
-                        echo -n -e "${BLUE}Enter RAM (GB) for ARM instance $i [default: 24]: ${NC}"
-                        read -r ram
-                        ram=${ram:-24}
-                        while true; do
-                            echo -n -e "${BLUE}Enter boot volume size (GB) for ARM instance $i [minimum 50GB, default: 100]: ${NC}"
-                            read -r boot
-                            boot=${boot:-100}
-                            if [[ "$boot" =~ ^[0-9]+$ ]] && [ "$boot" -ge 50 ]; then
-                                break
-                            else
-                                print_error "Boot volume must be at least 50GB (OCI requirement)"
-                            fi
-                        done
-                    fi
-                    arm_flex_ocpus_per_instance+="$ocpu "
-                    arm_flex_memory_per_instance+="$ram "
-                    arm_flex_boot_volume_size_gb+="$boot "
-                    arm_flex_block_volumes+=(0)
-                done
-                # Trim trailing spaces
-                arm_flex_ocpus_per_instance=$(echo $arm_flex_ocpus_per_instance | sed 's/[[:space:]]*$//')
-                arm_flex_memory_per_instance=$(echo $arm_flex_memory_per_instance | sed 's/[[:space:]]*$//')
-                arm_flex_boot_volume_size_gb=$(echo $arm_flex_boot_volume_size_gb | sed 's/[[:space:]]*$//')
-                break
-                ;;
-            *)
-                print_error "Invalid choice. Please enter a number between 1 and 3."
-                continue
-                ;;
-        esac
-    done
-}
-
-# Function to prompt user for instance hostnames
-prompt_instance_hostnames() {
-    print_status "Configuring instance hostnames..."
-    print_status "You can customize the hostnames for your instances."
-    print_status "Default pattern is: amd-instance-1, amd-instance-2, arm-instance-1, etc."
-    print_status ""
-    
-    # Check if hostnames are already loaded from existing config
-    local has_existing_amd=$([ "${#amd_micro_hostnames[@]}" -gt 0 ] && echo "true" || echo "false")
-    local has_existing_arm=$([ "${#arm_flex_hostnames[@]}" -gt 0 ] && echo "true" || echo "false")
-    local should_check_existing=false
-    
-    # Only check existing if we have instances configured and hostnames exist
-    if [ "$amd_micro_instance_count" -gt 0 ] && [ "$has_existing_amd" = "true" ]; then
-        should_check_existing=true
-    elif [ "$arm_flex_instance_count" -gt 0 ] && [ "$has_existing_arm" = "true" ]; then
-        should_check_existing=true
-    fi
-    
-    if [ "$should_check_existing" = "true" ]; then
-        print_status "Current hostnames from existing configuration:"
-        if [ "$amd_micro_instance_count" -gt 0 ]; then
-            print_status "  AMD instances: ${amd_micro_hostnames[*]}"
-        fi
-        if [ "$arm_flex_instance_count" -gt 0 ]; then
-            print_status "  ARM instances: ${arm_flex_hostnames[*]}"
-        fi
-        if [ "$NON_INTERACTIVE" = "true" ]; then
-            use_existing_hostnames="Y"
-            print_status "Non-interactive mode: Using existing hostnames"
-        else
-            echo -n -e "${BLUE}Use existing hostnames? (Y/n): ${NC}"
-            read -r use_existing_hostnames
-            use_existing_hostnames=${use_existing_hostnames:-Y}
-        fi
-        if [[ "$use_existing_hostnames" =~ ^[Yy]$ ]]; then
-            print_success "Using existing hostnames"
-            return 0
-        fi
-    fi
-    
-    # AMD instance hostnames - only if we have AMD instances
-    amd_micro_hostnames=()
-    if [ "$amd_micro_instance_count" -gt 0 ]; then
-        for ((i=1; i<=amd_micro_instance_count; i++)); do
-            default_hostname="amd-instance-$i"
-            if [ "$NON_INTERACTIVE" = "true" ]; then
-                hostname="$default_hostname"
-            else
-                echo -n -e "${BLUE}Enter hostname for AMD instance $i [default: $default_hostname]: ${NC}"
-                read -r hostname
-                hostname=${hostname:-$default_hostname}
-            fi
-            if [[ "$hostname" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$ ]] && [ ${#hostname} -le 63 ]; then
-                amd_micro_hostnames+=("$hostname")
-            else
-                print_warning "Invalid hostname format. Using default: $default_hostname"
-                amd_micro_hostnames+=("$default_hostname")
-            fi
-        done
-    fi
-    
-    # ARM instance hostnames - only if we have ARM instances
-    arm_flex_hostnames=()
-    if [ "$arm_flex_instance_count" -gt 0 ]; then
-        for ((i=1; i<=arm_flex_instance_count; i++)); do
-            default_hostname="arm-instance-$i"
-            if [ "$NON_INTERACTIVE" = "true" ]; then
-                hostname="$default_hostname"
-            else
-                echo -n -e "${BLUE}Enter hostname for ARM instance $i [default: $default_hostname]: ${NC}"
-                read -r hostname
-                hostname=${hostname:-$default_hostname}
-            fi
-            # Validate hostname (basic validation)
-            if [[ "$hostname" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$ ]] && [ ${#hostname} -le 63 ]; then
-                arm_flex_hostnames+=("$hostname")
-            else
-                print_warning "Invalid hostname format. Using default: $default_hostname"
-                arm_flex_hostnames+=("$default_hostname")
-            fi
-        done
-    fi
-    
-    print_success "Hostnames configured:"
-    if [ "$amd_micro_instance_count" -gt 0 ]; then
-        print_status "  AMD instances: ${amd_micro_hostnames[*]}"
-    else
-        print_status "  AMD instances: none configured"
-    fi
-    if [ "$arm_flex_instance_count" -gt 0 ]; then
-        print_status "  ARM instances: ${arm_flex_hostnames[*]}"
-    else
-        print_status "  ARM instances: none configured"
-    fi
-}
-
-# Function to create Terraform variables file (updated to include hostnames)
-create_terraform_vars() {
-    print_status "Creating variables.tf with fetched values..."
-    
-    # Backup existing file if it exists
-    if [ -f "variables.tf" ]; then
-        cp variables.tf "variables.tf.bak.$(date +%Y%m%d_%H%M%S)"
-        print_status "Backed up existing variables.tf with timestamp"
-    fi
-    
-    # Using OCI config file authentication - no additional setup required
-    
-    # Convert hostname arrays to Terraform list format - handle empty arrays properly
-    local amd_micro_hostnames_tf="["
-    if [ "${#amd_micro_hostnames[@]}" -gt 0 ]; then
-        for ((i=0; i<${#amd_micro_hostnames[@]}; i++)); do
-            if [ $i -gt 0 ]; then
-                amd_micro_hostnames_tf+=", "
-            fi
-            amd_micro_hostnames_tf+="\"${amd_micro_hostnames[$i]}\""
-        done
-    fi
-    amd_micro_hostnames_tf+="]"
-    
-    local arm_flex_hostnames_tf="["
-    if [ "${#arm_flex_hostnames[@]}" -gt 0 ]; then
-        for ((i=0; i<${#arm_flex_hostnames[@]}; i++)); do
-            if [ $i -gt 0 ]; then
-                arm_flex_hostnames_tf+=", "
-            fi
-            arm_flex_hostnames_tf+="\"${arm_flex_hostnames[$i]}\""
-        done
-    fi
-    arm_flex_hostnames_tf+="]"
-    
-    # Convert ARM instance configuration to Terraform list format
-    local arm_flex_ocpus_tf="["
-    local arm_flex_memory_tf="["
-    local arm_flex_boot_tf="["
-    
-    if [ "$arm_flex_instance_count" -gt 0 ]; then
-        if [ "$arm_flex_instance_count" -eq 1 ]; then
-            # Single instance - use the values directly
-            arm_flex_ocpus_tf+="$arm_flex_ocpus_per_instance"
-            arm_flex_memory_tf+="$arm_flex_memory_per_instance"
-            arm_flex_boot_tf+="$arm_flex_boot_volume_size_gb"
-        else
-            # Multiple instances - parse space-separated values
-            local ocpu_array=($arm_flex_ocpus_per_instance)
-            local memory_array=($arm_flex_memory_per_instance)
-            local boot_array=($arm_flex_boot_volume_size_gb)
-            
-            for ((i=0; i<${#ocpu_array[@]}; i++)); do
-                if [ $i -gt 0 ]; then
-                    arm_flex_ocpus_tf+=", "
-                    arm_flex_memory_tf+=", "
-                    arm_flex_boot_tf+=", "
-                fi
-                arm_flex_ocpus_tf+="${ocpu_array[$i]}"
-                arm_flex_memory_tf+="${memory_array[$i]}"
-                arm_flex_boot_tf+="${boot_array[$i]}"
-            done
-        fi
-    fi
-    
-    arm_flex_ocpus_tf+="]"
-    arm_flex_memory_tf+="]"
-    arm_flex_boot_tf+="]"
-    
-    # Create variables.tf with all dynamically fetched values
-    cat > variables.tf << EOF
-# Automatically generated OCI Terraform variables
-# Generated on: $(date)
-# Region: $region
-# Authentication: OCI config file (~/.oci/config)
-# Configuration: ${amd_micro_instance_count}x AMD + ${arm_flex_instance_count}x ARM instances
-
-locals {
-  # Per README: availability_domain == tenancy-ocid == compartment_id
-  availability_domain  = "$tenancy_ocid"
-  compartment_id       = "$tenancy_ocid"
-  
-  # Dynamically fetched Ubuntu images for region $region
-  ubuntu2404ocid       = "$ubuntu_image_ocid"
-  ubuntu2404_arm_flex_ocid  = "$ubuntu_arm_flex_image_ocid"
-  
-  user_ocid            = "$user_ocid"
-  fingerprint          = "$fingerprint"
-  tenancy_ocid         = "$tenancy_ocid"
-  region               = "$region"
-  
-  # SSH Configuration
-  ssh_pubkey_path      = pathexpand("./ssh_keys/id_rsa.pub")
-  ssh_pubkey_data      = file(pathexpand("./ssh_keys/id_rsa.pub"))
-  ssh_private_key_path = pathexpand("./ssh_keys/id_rsa")
-  
-  # Oracle Free Tier Instance Configuration
-  # AMD x86 instances (Always Free Eligible)
-  amd_micro_instance_count        = $amd_micro_instance_count
-  amd_micro_boot_volume_size_gb   = $amd_micro_boot_volume_size_gb
-  amd_micro_hostnames             = $amd_micro_hostnames_tf
-  
-  # ARM instances configuration (user-selected)
-  arm_flex_instance_count        = $([ -n "$ubuntu_arm_flex_image_ocid" ] && echo "$arm_flex_instance_count" || echo "0")
-  arm_flex_ocpus_per_instance    = $arm_flex_ocpus_tf
-  arm_flex_memory_per_instance   = $arm_flex_memory_tf
-  arm_flex_boot_volume_size_gb   = $arm_flex_boot_tf
-  arm_flex_hostnames             = $arm_flex_hostnames_tf
-  
-  # Block Storage Configuration for Maximum Always Free Tier Usage
-  # Note: Oracle Always Free Tier provides 200GB TOTAL storage (boot + block combined)
-  # Block volumes are slower than boot volumes, so by default we allocate all 200GB to boot volumes
-  # Block volume resources are included but set to 0 for optimal performance - users can customize if needed
-  amd_block_volume_size_gb = 0
-  
-  # ARM block volumes (set to 0 for optimal performance)
-  # Users can customize these if they prefer block volumes over larger boot volumes
-  arm_block_volume_sizes = [$(printf '%s,' "${arm_flex_block_volumes[@]}" | sed 's/,$//')]
-  
-  # Total block volume calculation
-  total_block_volume_gb = local.amd_micro_instance_count * local.amd_block_volume_size_gb + sum([for size in local.arm_block_volume_sizes : size])
-
-  # Boot volume usage validation
-  total_boot_volume_gb = local.amd_micro_instance_count * local.amd_micro_boot_volume_size_gb + sum(local.arm_flex_boot_volume_size_gb)
-}
-
-# Additional variables for reference
-variable "availability_domain_name" {
-  description = "The availability domain name"
-  type        = string
-  default     = "$availability_domain"
-}
-
-variable "instance_shape" {
-  description = "The shape of the instance"
-  type        = string
-  default     = "VM.Standard.E2.1.Micro"
-}
-
-variable "instance_shape_flex" {
-  description = "The flexible shape configuration"
-  type        = string
-  default     = "VM.Standard.A1.Flex"
-}
-
-# Boot volume size validation
-variable "max_free_tier_boot_volume_gb" {
-  description = "Maximum boot volume storage for Oracle Free Tier"
-  type        = number
-  default     = 200
-}
-
-# Total storage validation (boot + block volumes)
-variable "max_free_tier_total_storage_gb" {
-  description = "Maximum total storage (boot + block) for Oracle Free Tier"
-  type        = number
-  default     = 200
-}
-
-# Validation check for boot volumes
-check "free_tier_boot_volume_limit" {
-  assert {
-    condition     = local.total_boot_volume_gb <= var.max_free_tier_boot_volume_gb
-    error_message = "Total boot volume usage (\${local.total_boot_volume_gb}GB) exceeds Oracle Free Tier limit (\${var.max_free_tier_boot_volume_gb}GB)."
-  }
-}
-
-# Validation check for total storage
-check "free_tier_total_storage_limit" {
-  assert {
-    condition     = (local.total_boot_volume_gb + local.total_block_volume_gb) <= var.max_free_tier_total_storage_gb
-    error_message = "Total storage usage (\${local.total_boot_volume_gb + local.total_block_volume_gb}GB) exceeds Oracle Free Tier limit (\${var.max_free_tier_total_storage_gb}GB)."
-  }
-}
-EOF
-    
-    print_success "variables.tf created successfully with Oracle Free Tier configuration!"
-    print_status "Variables file contains:"
-    print_status "  - Tenancy OCID: $tenancy_ocid"
-    print_status "  - Region: $region"
-    print_status "  - Ubuntu x86 Image OCID: $ubuntu_image_ocid"
-    print_status "  - Ubuntu ARM Image OCID: $ubuntu_arm_flex_image_ocid"
-    print_status "  - Authentication: OCI config file (~/.oci/config)"
-    print_status "  - SSH Keys: ./ssh_keys/id_rsa"
-    if [ "$amd_micro_instance_count" -gt 0 ]; then
-        print_status "  - AMD Hostnames: ${amd_micro_hostnames[*]}"
-    else
-        print_status "  - AMD Instances: none configured"
-    fi
-    if [ "$arm_flex_instance_count" -gt 0 ]; then
-        print_status "  - ARM Hostnames: ${arm_flex_hostnames[*]}"
-    else
-        print_status "  - ARM Instances: none configured"
-    fi
-    print_status ""
-    print_status "CONFIGURED ORACLE FREE TIER SERVICES:"
-    print_status "  - Compute Instances: ${amd_micro_instance_count}x AMD + ${arm_flex_instance_count}x ARM instances"
-    print_status "  - Networking: VCNs, subnets, security groups"
-    print_status "  - Storage: Boot volumes (up to 200GB total)"
-    return 0
-}
-
-# Function to verify all requirements are met (updated for session tokens)
-verify_setup() {
-    print_status "Verifying complete setup..."
-    
-    # Check required files exist (using OCI config file authentication)
-    local required_files=(
-        "$HOME/.oci/config"
-        "./ssh_keys/id_rsa"
-        "./ssh_keys/id_rsa.pub"
-        "./variables.tf"
-    )
-    
-    for file in "${required_files[@]}"; do
-        if [ ! -f "$file" ]; then
-            print_error "Required file missing: $file"
-            return 1
-        fi
-    done
-    
-    # Test OCI CLI connectivity
-    print_status "Testing OCI CLI connectivity..."
-    if ! test_oci_connectivity; then
-        print_error "OCI CLI connectivity test failed"
-        return 1
-    fi
-    
-    # Verify Terraform variables are valid
-    print_status "Validating Terraform variables..."
-    if ! grep -q "ubuntu2404ocid.*ocid1.image" variables.tf; then
-        print_error "Invalid Ubuntu image OCID in variables.tf"
-        return 1
-    fi
-    
-    if ! grep -q "ubuntu2404_arm_flex_ocid.*ocid1.image" variables.tf; then
-        print_error "Invalid Ubuntu ARM image OCID in variables.tf"
-        return 1
-    fi
-    
-    print_success "All setup verification checks passed!"
-    return 0
-}
-
-# Function to run Terraform commands with proper error handling
-run_terraform_command() {
-    local command="$1"
-    local description="$2"
-    
-    print_status "$description..."
-
-    if eval "$command"; then
-        print_success "$description completed successfully"
-        return 0
-    else
-        print_error "$description failed"
-        return 1
-    fi
-}
-
-# Function to detect existing OCI resources that need to be imported
-detect_existing_resources() {
-    print_status "Detecting existing OCI resources that need to be imported..."
-    
-    # Initialize arrays to store existing resource information
-    existing_vcns=()
-    existing_subnets=()
-    existing_internet_gateways=()
-    existing_route_tables=()
-    existing_security_lists=()
-    existing_dhcp_options=()
-    existing_nsgs=()
-    existing_instances=()
-    existing_atp_databases=()
-    existing_adw_databases=()
-    existing_mysql_databases=()
-    existing_nosql_tables=()
-    existing_buckets=()
-    existing_vaults=()
-    existing_keys=()
-    existing_log_groups=()
-    existing_logs=()
-    existing_topics=()
-    existing_subscriptions=()
-    existing_alarms=()
-    existing_service_connectors=()
-    existing_apm_domains=()
-    
-    # Get existing VCNs
-    print_status "Checking for existing VCNs..."
-    local vcn_list=$(oci network vcn list --compartment-id "$tenancy_ocid" --query 'data[].{id:id,name:"display-name"}' 2>/dev/null)
-    if [ -n "$vcn_list" ] && [ "$vcn_list" != "[]" ]; then
-        print_status "Found existing VCNs:"
-        echo "$vcn_list" | jq -r '.[] | "  - \(.name): \(.id)"'
-        
-        # Store VCN information for import (accept ALL VCNs for import, not just specific naming patterns)
-        while IFS= read -r vcn_info; do
-            local vcn_id=$(echo "$vcn_info" | jq -r '.id')
-            local vcn_name=$(echo "$vcn_info" | jq -r '.name')
-            existing_vcns+=("$vcn_id:$vcn_name")
-            
-            # Get subnets for this VCN
-            local subnet_list=$(oci network subnet list --compartment-id "$tenancy_ocid" --vcn-id "$vcn_id" --query 'data[].{id:id,name:"display-name"}' 2>/dev/null)
-            if [ -n "$subnet_list" ] && [ "$subnet_list" != "[]" ]; then
-                while IFS= read -r subnet_info; do
-                    local subnet_id=$(echo "$subnet_info" | jq -r '.id')
-                    local subnet_name=$(echo "$subnet_info" | jq -r '.name')
-                    existing_subnets+=("$subnet_id:$subnet_name:$vcn_id")
-                done <<< "$(echo "$subnet_list" | jq -c '.[]')"
-            fi
-            
-            # Get internet gateways for this VCN
-            local ig_list=$(oci network internet-gateway list --compartment-id "$tenancy_ocid" --vcn-id "$vcn_id" --query 'data[].{id:id,name:"display-name"}' 2>/dev/null)
-            if [ -n "$ig_list" ] && [ "$ig_list" != "[]" ]; then
-                while IFS= read -r ig_info; do
-                    local ig_id=$(echo "$ig_info" | jq -r '.id')
-                    local ig_name=$(echo "$ig_info" | jq -r '.name')
-                    existing_internet_gateways+=("$ig_id:$ig_name:$vcn_id")
-                done <<< "$(echo "$ig_list" | jq -c '.[]')"
-            fi
-            
-            # Get route tables for this VCN
-            local rt_list=$(oci network route-table list --compartment-id "$tenancy_ocid" --vcn-id "$vcn_id" --query 'data[].{id:id,name:"display-name"}' 2>/dev/null)
-            if [ -n "$rt_list" ] && [ "$rt_list" != "[]" ]; then
-                while IFS= read -r rt_info; do
-                    local rt_id=$(echo "$rt_info" | jq -r '.id')
-                    local rt_name=$(echo "$rt_info" | jq -r '.name')
-                    existing_route_tables+=("$rt_id:$rt_name:$vcn_id")
-                done <<< "$(echo "$rt_list" | jq -c '.[]')"
-            fi
-            
-            # Get security lists for this VCN
-            local sl_list=$(oci network security-list list --compartment-id "$tenancy_ocid" --vcn-id "$vcn_id" --query 'data[].{id:id,name:"display-name"}' 2>/dev/null)
-            if [ -n "$sl_list" ] && [ "$sl_list" != "[]" ]; then
-                while IFS= read -r sl_info; do
-                    local sl_id=$(echo "$sl_info" | jq -r '.id')
-                    local sl_name=$(echo "$sl_info" | jq -r '.name')
-                    existing_security_lists+=("$sl_id:$sl_name:$vcn_id")
-                done <<< "$(echo "$sl_list" | jq -c '.[]')"
-            fi
-            
-            # Get DHCP options for this VCN
-            local dhcp_list=$(oci network dhcp-options list --compartment-id "$tenancy_ocid" --vcn-id "$vcn_id" --query 'data[].{id:id,name:"display-name"}' 2>/dev/null)
-            if [ -n "$dhcp_list" ] && [ "$dhcp_list" != "[]" ]; then
-                while IFS= read -r dhcp_info; do
-                    local dhcp_id=$(echo "$dhcp_info" | jq -r '.id')
-                    local dhcp_name=$(echo "$dhcp_info" | jq -r '.name')
-                    existing_dhcp_options+=("$dhcp_id:$dhcp_name:$vcn_id")
-                done <<< "$(echo "$dhcp_list" | jq -c '.[]')"
-            fi
-            
-            # Get network security groups for this VCN
-            local nsg_list=$(oci network nsg list --compartment-id "$tenancy_ocid" --vcn-id "$vcn_id" --query 'data[].{id:id,name:"display-name"}' 2>/dev/null)
-            if [ -n "$nsg_list" ] && [ "$nsg_list" != "[]" ]; then
-                while IFS= read -r nsg_info; do
-                    local nsg_id=$(echo "$nsg_info" | jq -r '.id')
-                    local nsg_name=$(echo "$nsg_info" | jq -r '.name')
-                    existing_nsgs+=("$nsg_id:$nsg_name:$vcn_id")
-                done <<< "$(echo "$nsg_list" | jq -c '.[]')"
-            fi
-            
-        done <<< "$(echo "$vcn_list" | jq -c '.[]')"
-    else
-        print_status "No existing VCNs found - clean slate deployment"
-    fi
-    
-    # Get existing compute instances
-    print_status "Checking for existing compute instances..."
-    local instance_list=$(oci compute instance list --compartment-id "$tenancy_ocid" --query 'data[].{id:id,name:"display-name",state:"lifecycle-state",shape:shape}' 2>/dev/null)
-    if [ -n "$instance_list" ] && [ "$instance_list" != "[]" ]; then
-        print_status "Found existing compute instances:"
-        echo "$instance_list" | jq -r '.[] | "  - \(.name) (\(.shape), \(.state)): \(.id)"'
-        while IFS= read -r instance_info; do
-            local instance_id=$(echo "$instance_info" | jq -r '.id')
-            local instance_name=$(echo "$instance_info" | jq -r '.name')
-            local instance_state=$(echo "$instance_info" | jq -r '.state')
-            local instance_shape=$(echo "$instance_info" | jq -r '.shape')
-            existing_instances+=("$instance_id:$instance_name:$instance_state:$instance_shape")
-        done <<< "$(echo "$instance_list" | jq -c '.[]')"
-    fi
-    
-    # Summary
-    print_status "Resource detection summary:"
-    print_status "  - VCNs: ${#existing_vcns[@]}"
-    print_status "  - Subnets: ${#existing_subnets[@]}"
-    print_status "  - Internet Gateways: ${#existing_internet_gateways[@]}"
-    print_status "  - Route Tables: ${#existing_route_tables[@]}"
-    print_status "  - Security Lists: ${#existing_security_lists[@]}"
-    print_status "  - DHCP Options: ${#existing_dhcp_options[@]}"
-    print_status "  - Network Security Groups: ${#existing_nsgs[@]}"
-    print_status "  - Compute Instances: ${#existing_instances[@]}"
-}
-
-# Function to import existing resources into Terraform state
-import_existing_resources() {
-    local has_existing_resources=false
-    
-    # Check if we have any existing resources to handle
-    if [ ${#existing_vcns[@]} -gt 0 ] || [ ${#existing_instances[@]} -gt 0 ]; then
-        has_existing_resources=true
-    fi
-    
-    if [ "$has_existing_resources" = "false" ]; then
-        print_status "No existing resources to import - proceeding with fresh deployment"
-        return 0
-    fi
-    
-    print_status "=========================================="
-    print_status "INTELLIGENT RESOURCE IMPORT/REUSE SYSTEM"
-    print_status "=========================================="
-    print_status "Found existing resources that can be imported/reused:"
-    
-    # Show comprehensive summary of all detected resources
-    if [ ${#existing_vcns[@]} -gt 0 ]; then
-        print_status "  📡 VCNs: ${#existing_vcns[@]} found"
-        for vcn_entry in "${existing_vcns[@]}"; do
-            local vcn_name=$(echo "$vcn_entry" | cut -d':' -f2)
-            print_status "    - $vcn_name"
-        done
-    fi
-    
-    if [ ${#existing_instances[@]} -gt 0 ]; then
-        print_status "  🖥️  Compute Instances: ${#existing_instances[@]} found"
-        for instance_entry in "${existing_instances[@]}"; do
-            local instance_name=$(echo "$instance_entry" | cut -d':' -f2)
-            local instance_shape=$(echo "$instance_entry" | cut -d':' -f4)
-            print_status "    - $instance_name ($instance_shape)"
-        done
-    fi
-    
-    print_status ""
-    print_status "RESOURCE HANDLING OPTIONS:"
-    print_status "1. 🔄 IMPORT ALL - Import existing resources into Terraform state (RECOMMENDED)"
-    print_status "   • Keeps existing resources and manages them with Terraform"
-    print_status "   • Prevents resource conflicts and duplicate creation"
-    print_status "   • Maintains existing configurations and data"
-    print_status ""
-    print_status "2. ⏭️  SKIP - Continue without handling existing resources"
-    print_status "   • May cause deployment conflicts"
-    print_status "   • Not recommended for production use"
-    print_status ""
-    
-    local resource_choice
-    while true; do
-        if [ "$NON_INTERACTIVE" = "true" ] || [ "$AUTO_USE_EXISTING" = "true" ]; then
-            resource_choice=1
-            print_status "Non-interactive mode: Importing existing resources (option 1)"
-        else
-            echo -n -e "${BLUE}Choose option (1-2) [default: 1]: ${NC}"
-            read -r resource_choice
-            resource_choice=${resource_choice:-1}
-        fi
-        
-        case $resource_choice in
-            1)
-                print_status "🔄 IMPORTING existing resources into Terraform state..."
-                break
-                ;;
-            2)
-                print_warning "⏭️  Skipping resource handling. You may encounter conflicts during apply."
-                print_warning "Or re-run this script and choose option 1 to import resources."
-                return 0
-                ;;
-            *)
-                print_error "Invalid choice. Please enter 1 or 2."
-                continue
-                ;;
-        esac
-    done
-    
-    # Start comprehensive resource import process
-    print_status ""
-    print_status "🔄 Starting comprehensive resource import process..."
-    print_status "This may take a few minutes depending on the number of resources..."
-    
-    # Import VCNs and networking resources
-    if [ ${#existing_vcns[@]} -gt 0 ]; then
-        print_status ""
-        print_status "📡 Importing VCN and networking resources..."
-        local vcn_index=0
-        local main_vcn_id=""
-        
-        for vcn_entry in "${existing_vcns[@]}"; do
-            local vcn_id=$(echo "$vcn_entry" | cut -d':' -f1)
-            local vcn_name=$(echo "$vcn_entry" | cut -d':' -f2)
-            
-            print_status "  Importing VCN: $vcn_name"
-            
-            # Try to import the first VCN as main_vcn
-            if [ $vcn_index -eq 0 ]; then
-                if terraform state show oci_core_vcn.main_vcn >/dev/null 2>&1; then
-                    print_status "  ✓ VCN '$vcn_name' already exists in state as main_vcn"
-                    main_vcn_id="$vcn_id"
-                elif terraform import oci_core_vcn.main_vcn "$vcn_id" 2>/dev/null; then
-                    print_success "  ✓ Successfully imported VCN '$vcn_name' as main_vcn"
-                    main_vcn_id="$vcn_id"
-                else
-                    print_warning "  ⚠ Failed to import VCN '$vcn_name' as main_vcn, continuing..."
-                    main_vcn_id="$vcn_id"
-                fi
-            else
-                print_status "  ℹ Additional VCN '$vcn_name' found - only importing first VCN for main infrastructure"
-            fi
-            
-            ((vcn_index++))
-        done
-        
-        # Import related networking resources for the main VCN
-        if [ -n "$main_vcn_id" ]; then
-            print_status "  Importing networking components for main VCN..."
-            
-            # Import Internet Gateway
-            for ig_entry in "${existing_internet_gateways[@]}"; do
-                local ig_id=$(echo "$ig_entry" | cut -d':' -f1)
-                local ig_name=$(echo "$ig_entry" | cut -d':' -f2)
-                local vcn_id=$(echo "$ig_entry" | cut -d':' -f3)
-                
-                if [ "$vcn_id" = "$main_vcn_id" ]; then
-                    print_status "    Importing Internet Gateway: $ig_name"
-                    if terraform state show oci_core_internet_gateway.main_internet_gateway >/dev/null 2>&1; then
-                        print_status "    ✓ Internet Gateway already in state"
-                    elif terraform import oci_core_internet_gateway.main_internet_gateway "$ig_id" 2>/dev/null; then
-                        print_success "    ✓ Successfully imported Internet Gateway"
-                    else
-                        print_warning "    ⚠ Failed to import Internet Gateway"
-                    fi
-                    break
-                fi
-            done
-            
-            # Import Subnet
-            for subnet_entry in "${existing_subnets[@]}"; do
-                local subnet_id=$(echo "$subnet_entry" | cut -d':' -f1)
-                local subnet_name=$(echo "$subnet_entry" | cut -d':' -f2)
-                local vcn_id=$(echo "$subnet_entry" | cut -d':' -f3)
-                
-                if [ "$vcn_id" = "$main_vcn_id" ]; then
-                    print_status "    Importing Subnet: $subnet_name"
-                    if terraform state show oci_core_subnet.main_subnet >/dev/null 2>&1; then
-                        print_status "    ✓ Subnet already in state"
-                    elif terraform import oci_core_subnet.main_subnet "$subnet_id" 2>/dev/null; then
-                        print_success "    ✓ Successfully imported Subnet"
-                    else
-                        print_warning "    ⚠ Failed to import Subnet"
-                    fi
-                    break
-                fi
-            done
-            
-            # Import Default Route Table
-            for rt_entry in "${existing_route_tables[@]}"; do
-                local rt_id=$(echo "$rt_entry" | cut -d':' -f1)
-                local rt_name=$(echo "$rt_entry" | cut -d':' -f2)
-                local vcn_id=$(echo "$rt_entry" | cut -d':' -f3)
-                
-                if [ "$vcn_id" = "$main_vcn_id" ] && [[ "$rt_name" == *"Default"* ]]; then
-                    print_status "    Importing Default Route Table: $rt_name"
-                    if terraform state show oci_core_default_route_table.main_route_table >/dev/null 2>&1; then
-                        print_status "    ✓ Default Route Table already in state"
-                    elif terraform import oci_core_default_route_table.main_route_table "$rt_id" 2>/dev/null; then
-                        print_success "    ✓ Successfully imported Default Route Table"
-                    else
-                        print_warning "    ⚠ Failed to import Default Route Table"
-                    fi
-                    break
-                fi
-            done
-            
-            # Import Default Security List
-            for sl_entry in "${existing_security_lists[@]}"; do
-                local sl_id=$(echo "$sl_entry" | cut -d':' -f1)
-                local sl_name=$(echo "$sl_entry" | cut -d':' -f2)
-                local vcn_id=$(echo "$sl_entry" | cut -d':' -f3)
-                
-                if [ "$vcn_id" = "$main_vcn_id" ] && [[ "$sl_name" == *"Default"* ]]; then
-                    print_status "    Importing Default Security List: $sl_name"
-                    if terraform state show oci_core_default_security_list.main_security_list >/dev/null 2>&1; then
-                        print_status "    ✓ Default Security List already in state"
-                    elif terraform import oci_core_default_security_list.main_security_list "$sl_id" 2>/dev/null; then
-                        print_success "    ✓ Successfully imported Default Security List"
-                    else
-                        print_warning "    ⚠ Failed to import Default Security List"
-                    fi
-                    break
-                fi
-            done
-        fi
-    fi
-    
-    # Import Compute Instances
-    if [ ${#existing_instances[@]} -gt 0 ]; then
-        print_status ""
-        print_status "🖥️  Importing compute instances..."
-        local instance_index=0
-        for instance_entry in "${existing_instances[@]}"; do
-            local instance_id=$(echo "$instance_entry" | cut -d':' -f1)
-            local instance_name=$(echo "$instance_entry" | cut -d':' -f2)
-            local instance_state=$(echo "$instance_entry" | cut -d':' -f3)
-            local instance_shape=$(echo "$instance_entry" | cut -d':' -f4)
-            
-            print_status "  Importing compute instance: $instance_name ($instance_shape, $instance_state)"
-            
-            # Determine appropriate Terraform resource based on instance type
-            local import_targets=()
-            if [[ "$instance_shape" == *"Micro"* ]]; then
-                import_targets+=("oci_core_instance.amd_micro_instances[0]" "oci_core_instance.amd_micro_instances[1]")
-            elif [[ "$instance_shape" == *"A1"* ]]; then
-                import_targets+=("oci_core_instance.arm_flex_instances[0]" "oci_core_instance.arm_flex_instances[1]")
-            else
-                import_targets+=("oci_core_instance.main_instance" "oci_core_instance.instance_${instance_index}")
-            fi
-            
-            local imported=false
-            for target in "${import_targets[@]}"; do
-                if terraform state show "$target" >/dev/null 2>&1; then
-                    print_status "    ✓ Instance already in state as $target"
-                    imported=true
-                    break
-                elif terraform import "$target" "$instance_id" 2>/dev/null; then
-                    print_success "    ✓ Successfully imported instance as $target"
-                    imported=true
-                    break
-                fi
-            done
-            
-            if [ "$imported" = "false" ]; then
-                print_warning "    ⚠ Failed to import instance '$instance_name' - may need manual handling"
-            fi
-            
-            ((instance_index++))
-            if [ $instance_index -ge 4 ]; then
-                print_status "  ℹ Limiting to first 4 instances to avoid resource conflicts"
-                break
-            fi
-        done
-    fi
-    
-    print_status ""
-    print_success "🎉 COMPREHENSIVE RESOURCE IMPORT COMPLETED!"
-    print_status "=========================================="
-    print_status "Import Summary:"
-    print_status "  ✅ All compatible existing resources have been imported into Terraform state"
-    print_status "  ✅ Resources are now managed by Terraform and won't be recreated"
-    print_status "  ✅ Existing configurations and data have been preserved"
-    print_status "  ✅ Ready to proceed with Terraform plan and apply operations"
-    print_status ""
-    print_status "📋 Next Steps:"
-    print_status "  1. Terraform will validate the imported resources"
-    print_status "  2. A plan will be generated showing any required changes"
-    print_status "  3. You can review and apply the changes to complete deployment"
-    print_status ""
-    print_status "⚠️  Note: Some resources may show minor configuration differences"
-    print_status "   This is normal and Terraform will align them with your configuration"
-    print_status ""
-    
-    # Always return success to continue the workflow
-    return 0
-}
-
-# Function to run complete Terraform workflow
-run_terraform_workflow() {
-    print_status "Starting complete Terraform workflow..."
-    
-    # Ensure we're in the correct directory with Terraform files
-    if [ ! -f "main.tf" ] || [ ! -f "variables.tf" ]; then
-        print_error "main.tf or variables.tf not found in current directory"
-        print_status "Please ensure you're in the correct directory with your Terraform configuration"
-        return 1
-    fi
-    
-    # Step 1: Initialize Terraform
-    if ! run_terraform_command "terraform init" "Terraform initialization"; then
-        return 1
-    fi
-    
-    # Step 2: Detect existing resources
-    detect_existing_resources
-    
-    # Step 3: Handle existing resources
-    if [ ${#existing_vcns[@]} -gt 0 ]; then
-        print_status "Existing resources detected that may conflict with deployment:"
-        for vcn_entry in "${existing_vcns[@]}"; do
-            local vcn_name=$(echo "$vcn_entry" | cut -d':' -f2)
-            local vcn_id=$(echo "$vcn_entry" | cut -d':' -f1)
-            print_status "  - VCN: $vcn_name ($vcn_id)"
-        done
-        print_status ""
-        print_status "Choose how to handle existing resources:"
-        print_status "1. Import existing resources into Terraform state (recommended)"
-        print_status "2. Skip resource handling (may cause conflicts)"
-        print_status ""
-        
-        while true; do
-            if [ "$NON_INTERACTIVE" = "true" ]; then
-                resource_choice=1
-                print_status "Non-interactive mode: Importing existing resources (option 1)"
-            else
-                echo -n -e "${BLUE}Choose option (1-2) [default: 1]: ${NC}"
-                read -r resource_choice
-                resource_choice=${resource_choice:-1}
-            fi
-            
-            case $resource_choice in
-                1)
-                    print_status "Importing existing resources into Terraform state..."
-                    if import_existing_resources; then
-                        print_success "Resource import completed successfully"
-                    else
-                        print_warning "Resource import had some issues but continuing..."
-                    fi
-                    break
-                    ;;
-                2)
-                    print_warning "Skipping resource handling. You may encounter conflicts during apply."
-                    break
-                    ;;
-                *)
-                    print_error "Invalid choice. Please enter 1 or 2."
-                    continue
-                    ;;
-            esac
-        done
-    else
-        print_status "No existing resources detected - proceeding with clean deployment"
-    fi
-    
-    # Explicitly continue with the rest of the workflow
-    print_status ""
-    print_status "=========================================="
-    print_status "CONTINUING WITH TERRAFORM DEPLOYMENT..."
-    print_status "=========================================="
-    print_status ""
-    
-    # Step 4: Validate Terraform configuration
-    print_status "Step 4: Validating Terraform configuration..."
-    if ! run_terraform_command "terraform validate" "Terraform validation"; then
-        print_error "Terraform validation failed. Please check your configuration files."
-        return 1
-    fi
-    
-    # Step 5: Format Terraform files
-    print_status "Step 5: Formatting Terraform files..."
-    run_terraform_command "terraform fmt" "Terraform formatting" || print_warning "Formatting failed but continuing..."
-    
-    # Step 6: Plan Terraform changes
-    print_status "Step 6: Creating Terraform execution plan..."
-    print_status "This may take a few minutes as Terraform analyzes your configuration..."
-    
-    if terraform plan -out=tfplan; then
-        print_success "Terraform plan created successfully"
-        print_status "Plan saved as 'tfplan'"
-        
-        # Show plan summary
-        print_status ""
-        print_status "========== TERRAFORM PLAN SUMMARY =========="
-        terraform show tfplan | grep -E "^  # |^Plan:" | tail -20
-        print_status "==========================================="
-        print_status ""
-        
-    else
-        print_error "Terraform plan failed"
-        print_status "Common issues:"
-        print_status "  - Resource conflicts (try importing existing resources)"
-        print_status "  - Authentication issues (check OCI CLI config)"
-        print_status "  - Configuration errors (check main.tf and variables.tf)"
-        return 1
-    fi
-    
-    # Step 7: Ask user if they want to apply
-    print_status "Terraform plan completed successfully!"
-    print_status "Review the plan above to see what resources will be created/modified."
-    print_status ""
-    if [ "$AUTO_DEPLOY" = "true" ] || [ "$NON_INTERACTIVE" = "true" ]; then
-        apply_choice="Y"
-        print_status "Non-interactive/auto-deploy mode: Auto-applying Terraform plan"
-    else
-        echo -n -e "${BLUE}Would you like to apply the Terraform plan now? (Y/n): ${NC}"
-        read -r apply_choice
-        apply_choice=${apply_choice:-Y}
-    fi
-    
-    if [[ "$apply_choice" =~ ^[Yy]$ ]]; then
-        print_status "Step 7: Applying Terraform plan..."
-        print_status "This will deploy your Oracle Cloud infrastructure. Please wait..."
-        
-        if terraform apply tfplan; then
-            print_success "🎉 Terraform apply completed successfully!"
-            print_success "Your Oracle Cloud infrastructure is now fully deployed and managed by Terraform!"
-            
-            # Clean up plan file
-            rm -f tfplan
-            
-            # Show final status
-            print_status ""
-            print_status "========== DEPLOYMENT SUMMARY =========="
-            print_status "Fetching deployed resources..."
-            
-            # Show resource counts and types
-            local resource_count=$(terraform state list | wc -l)
-            print_status "Total managed resources: $resource_count"
-            print_status ""
-            print_status "Resource breakdown:"
-            terraform state list | cut -d'.' -f1 | sort | uniq -c | while read count type; do
-                print_status "  - $type: $count"
-            done
-            
-            print_status ""
-            print_status "Instance details:"
-            terraform show -json 2>/dev/null | jq -r '
-              .values.root_module.resources[]
-              | select(.type == "oci_core_instance")
-              | "  - \(.values.display_name): IPv4=\(.values.public_ip // "pending"), IPv6=\(.values.ipv6_addresses[0] // "none")"
-            ' 2>/dev/null || print_status "  (Instance details require jq)"
-            
-            print_status "========================================"
-            print_status ""
-            print_success "✅ FULL DEPLOYMENT COMPLETED SUCCESSFULLY!"
-            print_success "Your Oracle Always Free Tier infrastructure is now ready to use."
-            
-        else
-            print_error "❌ Terraform apply failed"
-            print_status "The plan file 'tfplan' has been preserved for debugging"
-            print_status "Common apply issues:"
-            print_status "  - Service limits exceeded (check Oracle Cloud limits)"
-            print_status "  - Resource naming conflicts"
-            print_status "  - Network configuration issues"
-            print_status "  - Authentication/permission issues"
-            return 1
-        fi
-    else
-        print_status "Terraform plan has been saved as 'tfplan'"
-        print_status "You can apply it later with: terraform apply tfplan"
-        print_status "Or create a fresh plan with: terraform plan"
-        print_warning "Note: Infrastructure has NOT been deployed yet."
-    fi
-    
-    return 0
-}
-
-# Function to provide Terraform management options
-terraform_management_menu() {
-    while true; do
-        print_status ""
-        print_status "========== TERRAFORM MANAGEMENT MENU =========="
-        print_status "1. Run full workflow (init, plan, apply)"
-        print_status "2. Initialize only"
-        print_status "3. Plan only"
-        print_status "4. Apply existing plan"
-        print_status "5. Import existing resources"
-        print_status "6. Destroy infrastructure"
-        print_status "7. Show current state"
-        print_status "8. Validate configuration"
-        print_status "9. Go back and reconfigure"
-        print_status "10. Quit"
-        print_status "==============================================="
-        print_status ""
-        
-        if [ "$AUTO_DEPLOY" = "true" ]; then
-            tf_choice=1
-            print_status "Non-interactive mode: Running full workflow (option 1)"
-        else
-            echo -n -e "${BLUE}Choose an option (1-10) [default: 1]: ${NC}"
-            read -r tf_choice
-            tf_choice=${tf_choice:-1}
-        fi
-        
-        case $tf_choice in
-            1)
-                print_status "Running full Terraform workflow..."
-                run_terraform_workflow
-                ;;
-            2)
-                run_terraform_command "terraform init" "Terraform initialization"
-                ;;
-            3)
-                run_terraform_command "terraform init" "Terraform initialization" && \
-                run_terraform_command "terraform plan" "Terraform planning"
-                ;;
-            4)
-                if [ -f "tfplan" ]; then
-                    run_terraform_command "terraform apply tfplan" "Applying existing plan"
-                else
-                    print_error "No existing plan file found. Run 'terraform plan' first."
-                fi
-                ;;
-            5)
-                run_terraform_command "terraform init" "Terraform initialization" && \
-                detect_existing_resources && \
-                import_existing_resources
-                ;;
-            6)
-                print_warning "This will DESTROY all Terraform-managed infrastructure!"
-                echo -n -e "${RED}Are you absolutely sure? Type 'yes' to confirm: ${NC}"
-                read -r destroy_confirm
-                if [ "$destroy_confirm" = "yes" ]; then
-                    run_terraform_command "terraform destroy" "Destroying infrastructure"
-                else
-                    print_status "Destroy cancelled."
-                fi
-                ;;
-            7)
-                run_terraform_command "terraform show" "Showing current state"
-                ;;
-            8)
-                run_terraform_command "terraform validate" "Terraform validation"
-                ;;
-            9)
-                print_status "Going back to reconfigure setup..."
-                return 1  # Signal to restart configuration
-                ;;
-            10)
-                print_status "Exiting Terraform management."
-                return 0  # Signal to quit
-                ;;
-            *)
-                print_error "Invalid choice. Please enter a number between 1 and 10."
-                continue
-                ;;
-        esac
-        
-        # Wait for user input before showing menu again (except for quit/reconfigure)
-        if [ "$tf_choice" != "9" ] && [ "$tf_choice" != "10" ]; then
-            if [ "$NON_INTERACTIVE" = "true" ] || [ "$AUTO_DEPLOY" = "true" ]; then
-                # In non-interactive mode, exit after first operation
-                print_status "Non-interactive mode: Exiting after operation completion"
-                return 0
-            else
-                echo ""
-                echo -n -e "${BLUE}Press any key to continue...${NC}"
-                read -n 1 -s
-                echo ""
-            fi
-        fi
-    done
-}
-
-# Function to install Terraform
 install_terraform() {
+    print_subheader "Terraform Setup"
+    
     if command_exists terraform; then
-        local tf_version=$(terraform version -json 2>/dev/null | jq -r '.terraform_version' 2>/dev/null || terraform version | head -1 | awk '{print $2}' | sed 's/v//')
-        print_status "Terraform already installed: version $tf_version"
+        local version
+        version=$(terraform version -json 2>/dev/null | jq -r '.terraform_version' 2>/dev/null) || \
+        version=$(terraform version | head -1 | awk '{print $2}' | sed 's/v//')
+        print_status "Terraform already installed: version $version"
         return 0
     fi
     
     print_status "Installing Terraform..."
+    
+    # Try snap first on Ubuntu/Debian
     if command_exists snap; then
-        sudo snap install terraform --classic
-        return 0
+        if sudo snap install terraform --classic; then
+            print_success "Terraform installed via snap"
+            return 0
+        fi
     fi
     
-    # Get the latest Terraform version
-    local latest_version=$(curl -s https://api.github.com/repos/hashicorp/terraform/releases/latest | jq -r '.tag_name' | sed 's/v//')
-    if [ -z "$latest_version" ]; then
-        latest_version="1.7.0"  # Fallback version
+    # Manual installation
+    local latest_version
+    latest_version=$(curl -s https://api.github.com/repos/hashicorp/terraform/releases/latest | jq -r '.tag_name' | sed 's/v//')
+    
+    if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
+        latest_version="1.7.0"
         print_warning "Could not fetch latest version, using fallback: $latest_version"
     fi
     
-    # Determine architecture
     local arch="amd64"
     if [ "$(uname -m)" = "aarch64" ]; then
         arch="arm64"
     fi
     
-    # Download and install Terraform
-    local tf_url="https://releases.hashicorp.com/terraform/${latest_version}/terraform_${latest_version}_linux_${arch}.zip"
+    local os="linux"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        os="darwin"
+    fi
     
-    print_status "Downloading Terraform $latest_version for linux_$arch..."
+    local tf_url="https://releases.hashicorp.com/terraform/${latest_version}/terraform_${latest_version}_${os}_${arch}.zip"
+    local temp_dir
+    temp_dir=$(mktemp -d)
     
-    # Create temporary directory
-    local temp_dir=$(mktemp -d)
-    cd "$temp_dir"
+    print_status "Downloading Terraform $latest_version for ${os}_${arch}..."
     
-    # Download Terraform
-    if curl -LO "$tf_url"; then
-        # Unzip
-        if command_exists unzip; then
-            unzip "terraform_${latest_version}_linux_${arch}.zip"
-        else
-            print_status "Installing unzip..."
-            sudo apt-get update && sudo apt-get install -y unzip
-            unzip "terraform_${latest_version}_linux_${arch}.zip"
-        fi
-        
-        # Install to /usr/local/bin
-        sudo mv terraform /usr/local/bin/
+    if curl -sLo "$temp_dir/terraform.zip" "$tf_url"; then
+        unzip -q "$temp_dir/terraform.zip" -d "$temp_dir"
+        sudo mv "$temp_dir/terraform" /usr/local/bin/
         sudo chmod +x /usr/local/bin/terraform
-        
-        # Cleanup
-        cd - > /dev/null
         rm -rf "$temp_dir"
         
-        # Verify installation
         if command_exists terraform; then
-            local installed_version=$(terraform version -json 2>/dev/null | jq -r '.terraform_version' 2>/dev/null || terraform version | head -1 | awk '{print $2}' | sed 's/v//')
-            print_success "Terraform $installed_version installed successfully"
+            print_success "Terraform installed successfully"
             return 0
-        else
-            print_error "Terraform installation failed"
-            return 1
         fi
-    else
-        print_error "Failed to download Terraform"
-        cd - > /dev/null
-        rm -rf "$temp_dir"
+    fi
+    
+    rm -rf "$temp_dir"
+    print_error "Failed to install Terraform"
+    return 1
+}
+
+# ============================================================================
+# OCI AUTHENTICATION FUNCTIONS
+# ============================================================================
+
+detect_auth_method() {
+    if [ -f ~/.oci/config ]; then
+        if grep -q "security_token_file" ~/.oci/config; then
+            auth_method="security_token"
+        elif grep -q "key_file" ~/.oci/config; then
+            auth_method="api_key"
+        fi
+    fi
+    print_debug "Detected auth method: $auth_method"
+}
+
+setup_oci_config() {
+    print_subheader "OCI Authentication"
+    
+    mkdir -p ~/.oci
+    
+    if [ -f ~/.oci/config ]; then
+        print_status "Existing OCI configuration found"
+        detect_auth_method
+        
+        # Test existing configuration
+        if test_oci_connectivity; then
+            print_success "Existing OCI configuration is valid"
+            return 0
+        fi
+        
+        print_warning "Existing configuration failed connectivity test"
+        
+        # Check if session token expired
+        if [ "$auth_method" = "security_token" ]; then
+            print_status "Attempting to refresh session token..."
+            if oci session refresh --profile DEFAULT 2>/dev/null; then
+                if test_oci_connectivity; then
+                    print_success "Session token refreshed successfully"
+                    return 0
+                fi
+            fi
+            
+            print_status "Session refresh failed, initiating new authentication..."
+        fi
+    fi
+    
+    # Setup new authentication
+    print_status "Setting up browser-based authentication..."
+    print_status "This will open a browser window for you to log in to Oracle Cloud."
+    
+    if ! oci session authenticate; then
+        print_error "Browser authentication failed"
         return 1
     fi
-}
-
-# Function to create missing data sources and resources
-create_missing_terraform_resources() {
-    print_status "Creating missing Terraform data sources and resources..."
     
-    # Create data_sources.tf with required data sources
-    print_status "Creating data_sources.tf with required data sources..."
-    if [ -f "data_sources.tf" ]; then
-        cp data_sources.tf "data_sources.tf.bak.$(date +%Y%m%d_%H%M%S)"
-        print_status "Backed up existing data_sources.tf with timestamp"
-    fi
-        cat > data_sources.tf << EOF
-# Data sources for Oracle Cloud Infrastructure
-# Generated on: $(date)
-
-# Get availability domains
-data "oci_identity_availability_domains" "ads" {
-  compartment_id = local.tenancy_ocid
-}
-
-# Get current user information
-data "oci_identity_user" "current_user" {
-  user_id = local.user_ocid
-}
-
-# Get tenancy information
-data "oci_identity_tenancy" "tenancy" {
-  tenancy_id = local.tenancy_ocid
-}
-
-# Get regions
-data "oci_identity_regions" "regions" {
-}
-
-# Get current region
-data "oci_identity_region_subscriptions" "region_subscriptions" {
-  tenancy_id = local.tenancy_ocid
-}
-EOF
-        print_success "data_sources.tf created successfully"
+    auth_method="security_token"
     
-    # Create main infrastructure configuration
-    print_status "Creating main.tf with complete infrastructure configuration..."
-    if [ -f "main.tf" ]; then
-        cp main.tf "main.tf.bak.$(date +%Y%m%d_%H%M%S)"
-        print_status "Backed up existing main.tf with timestamp"
+    # Verify the new configuration
+    if test_oci_connectivity; then
+        print_success "OCI authentication configured successfully"
+        return 0
     fi
-        cat > main.tf << EOF
-# Main Oracle Cloud Infrastructure (OCI) Terraform Configuration
-# Generated on: $(date)
-
-# ============================================================================
-# NETWORKING INFRASTRUCTURE
-# ============================================================================
-
-# Main VCN
-resource "oci_core_vcn" "main_vcn" {
-  compartment_id = local.tenancy_ocid
-  cidr_blocks    = ["10.16.0.0/16"]
-  display_name   = "main-vcn"
-  dns_label      = "mainvcn"
-  is_ipv6enabled = true
-  
-  freeform_tags = {
-    "Purpose" = "AlwaysFreeTierMaximization"
-    "Type"    = "MainNetworking"
-  }
+    
+    print_error "OCI configuration verification failed"
+    return 1
 }
 
-# Main Subnet
-resource "oci_core_subnet" "main_subnet" {
-  compartment_id = local.tenancy_ocid
-  vcn_id         = oci_core_vcn.main_vcn.id
-  cidr_block     = "10.16.1.0/24"
-  display_name   = "main-subnet"
-  dns_label      = "mainsubnet"
-  ipv6cidr_blocks = [cidrsubnet(oci_core_vcn.main_vcn.ipv6cidr_blocks[0], 8, 1)]
-  
-  route_table_id    = oci_core_default_route_table.main_route_table.id
-  security_list_ids = [oci_core_default_security_list.main_security_list.id]
-  dhcp_options_id   = oci_core_vcn.main_vcn.default_dhcp_options_id
-  
-  freeform_tags = {
-    "Purpose" = "AlwaysFreeTierMaximization"
-    "Type"    = "MainSubnet"
-  }
-}
-
-# Internet Gateway
-resource "oci_core_internet_gateway" "main_internet_gateway" {
-  compartment_id = local.tenancy_ocid
-  vcn_id         = oci_core_vcn.main_vcn.id
-  display_name   = "main-internet-gateway"
-  enabled        = true
-  
-  freeform_tags = {
-    "Purpose" = "AlwaysFreeTierMaximization"
-    "Type"    = "InternetAccess"
-  }
-}
-
-# Default Route Table
-resource "oci_core_default_route_table" "main_route_table" {
-  manage_default_resource_id = oci_core_vcn.main_vcn.default_route_table_id
-  display_name               = "main-route-table"
-  
-  route_rules {
-    destination       = "0.0.0.0/0"
-    destination_type  = "CIDR_BLOCK"
-    network_entity_id = oci_core_internet_gateway.main_internet_gateway.id
-  }
-  
-  route_rules {
-    destination       = "::/0"
-    destination_type  = "CIDR_BLOCK"
-    network_entity_id = oci_core_internet_gateway.main_internet_gateway.id
-  }
-  
-  freeform_tags = {
-    "Purpose" = "AlwaysFreeTierMaximization"
-    "Type"    = "MainRouting"
-  }
-}
-
-# Default Security List
-resource "oci_core_default_security_list" "main_security_list" {
-  manage_default_resource_id = oci_core_vcn.main_vcn.default_security_list_id
-  display_name               = "main-security-list"
-  
-  # Egress rules - allow all outbound
-  egress_security_rules {
-    destination = "0.0.0.0/0"
-    protocol    = "all"
-  }
-  
-  # Ingress rules
-  # SSH
-  ingress_security_rules {
-    protocol = "6" # TCP
-    source   = "0.0.0.0/0"
-    tcp_options {
-      min = 22
-      max = 22
-    }
-  }
-  
-  # HTTP
-  ingress_security_rules {
-    protocol = "6" # TCP
-    source   = "0.0.0.0/0"
-    tcp_options {
-      min = 80
-      max = 80
-    }
-  }
-  
-  # HTTPS
-  ingress_security_rules {
-    protocol = "6" # TCP
-    source   = "0.0.0.0/0"
-    tcp_options {
-      min = 443
-      max = 443
-    }
-  }
-  
-  # ICMP
-  ingress_security_rules {
-    protocol = "1" # ICMP
-    source   = "0.0.0.0/0"
-  }
-  
-  freeform_tags = {
-    "Purpose" = "AlwaysFreeTierMaximization"
-    "Type"    = "MainSecurity"
-  }
-}
-
-# ARM A1 Flex Instances (Always Free Eligible)
-resource "oci_core_instance" "arm_flex_instances" {
-  count = local.arm_flex_instance_count
-  
-  availability_domain = data.oci_identity_availability_domains.ads.availability_domains[0].name
-  compartment_id      = local.tenancy_ocid
-  display_name        = local.arm_flex_hostnames[count.index]
-  shape               = "VM.Standard.A1.Flex"
-  
-  shape_config {
-    ocpus         = local.arm_flex_ocpus_per_instance[count.index]
-    memory_in_gbs = local.arm_flex_memory_per_instance[count.index]
-  }
-  
-  create_vnic_details {
-    subnet_id        = oci_core_subnet.main_subnet.id
-    display_name     = "\${local.arm_flex_hostnames[count.index]}-vnic"
-    assign_public_ip = true
-    hostname_label   = local.arm_flex_hostnames[count.index]
-  }
-  
-  source_details {
-    source_type = "image"
-    source_id   = local.ubuntu2404_arm_flex_ocid
-    boot_volume_size_in_gbs = local.arm_flex_boot_volume_size_gb[count.index]
-  }
-  
-  metadata = {
-    ssh_authorized_keys = local.ssh_pubkey_data
-    user_data = base64encode(templatefile("\${path.module}/cloud-init.yaml", {
-      hostname = local.arm_flex_hostnames[count.index]
-    }))
-  }
-  
-  freeform_tags = {
-    "Purpose"      = "AlwaysFreeTierMaximization"
-    "InstanceType" = "ARM-A1-AlwaysFree"
-    "Architecture" = "aarch64"
-    "Hostname"     = local.arm_flex_hostnames[count.index]
-  }
-}
-
-# AMD x86 Micro Instances (Always Free Eligible)
-resource "oci_core_instance" "amd_micro_instances" {
-  count = local.amd_micro_instance_count
-  
-  availability_domain = data.oci_identity_availability_domains.ads.availability_domains[0].name
-  compartment_id      = local.tenancy_ocid
-  display_name        = local.amd_micro_hostnames[count.index]
-  shape               = "VM.Standard.E2.1.Micro"
-  
-  create_vnic_details {
-    subnet_id        = oci_core_subnet.main_subnet.id
-    display_name     = "\${local.amd_micro_hostnames[count.index]}-vnic"
-    assign_public_ip = true
-    hostname_label   = local.amd_micro_hostnames[count.index]
-  }
-  
-  source_details {
-    source_type = "image"
-    source_id   = local.ubuntu2404ocid
-    boot_volume_size_in_gbs = local.amd_micro_boot_volume_size_gb
-  }
-  
-  metadata = {
-    ssh_authorized_keys = local.ssh_pubkey_data
-    user_data = base64encode(templatefile("\${path.module}/cloud-init.yaml", {
-      hostname = local.amd_micro_hostnames[count.index]
-    }))
-  }
-  
-  freeform_tags = {
-    "Purpose"      = "AlwaysFreeTierMaximization"
-    "InstanceType" = "AMD-x86-AlwaysFree"
-    "Architecture" = "x86_64"
-    "Hostname"     = local.amd_micro_hostnames[count.index]
-  }
+test_oci_connectivity() {
+    print_debug "Testing OCI API connectivity..."
+    
+    # Method 1: List regions (simplest test)
+    if oci_cmd "iam region list" >/dev/null 2>&1; then
+        print_debug "Connectivity test passed (region list)"
+        return 0
+    fi
+    
+    # Method 2: Get tenancy info if we have it
+    local test_tenancy
+    test_tenancy=$(grep -oP '(?<=tenancy=).*' ~/.oci/config 2>/dev/null | head -1)
+    
+    if [ -n "$test_tenancy" ]; then
+        if oci_cmd "iam tenancy get --tenancy-id $test_tenancy" >/dev/null 2>&1; then
+            print_debug "Connectivity test passed (tenancy get)"
+            return 0
+        fi
+    fi
+    
+    print_debug "All connectivity tests failed"
+    return 1
 }
 
 # ============================================================================
-# OUTPUTS
+# OCI RESOURCE DISCOVERY FUNCTIONS
 # ============================================================================
 
-# ARM Instance Information
-output "arm_instances_complete_summary" {
-  description = "Complete ARM instance details and connection information"
-  value = {
-    instances = local.arm_flex_instance_count > 0 ? [
-      for i in range(local.arm_flex_instance_count) : {
-        instance_name    = local.arm_flex_hostnames[i]
-        instance_id      = oci_core_instance.arm_flex_instances[i].id
-        public_ip        = oci_core_instance.arm_flex_instances[i].public_ip
-        private_ip       = oci_core_instance.arm_flex_instances[i].private_ip
-        shape            = oci_core_instance.arm_flex_instances[i].shape
-        ocpus            = local.arm_flex_ocpus_per_instance[i]
-        memory_gb        = local.arm_flex_memory_per_instance[i]
-        boot_volume_gb   = local.arm_flex_boot_volume_size_gb[i]
-        ssh_command      = "ssh -i ./ssh_keys/id_rsa ubuntu@\${oci_core_instance.arm_flex_instances[i].public_ip}"
-        state            = oci_core_instance.arm_flex_instances[i].state
-      }
-    ] : []
-    total_instances = local.arm_flex_instance_count
-    total_ocpus     = local.arm_flex_instance_count > 0 ? sum(local.arm_flex_ocpus_per_instance) : 0
-    total_memory_gb = local.arm_flex_instance_count > 0 ? sum(local.arm_flex_memory_per_instance) : 0
-    architecture    = "aarch64"
-    note           = local.arm_flex_instance_count > 0 ? "ARM instances configured" : "No ARM instances configured"
-  }
-}
-
-# AMD Instance Information
-output "amd_instances_complete_summary" {
-  description = "Complete AMD instance details and connection information"
-  value = {
-    instances = local.amd_micro_instance_count > 0 ? [
-      for i in range(local.amd_micro_instance_count) : {
-        instance_name    = local.amd_micro_hostnames[i]
-        instance_id      = oci_core_instance.amd_micro_instances[i].id
-        public_ip        = oci_core_instance.amd_micro_instances[i].public_ip
-        private_ip       = oci_core_instance.amd_micro_instances[i].private_ip
-        shape            = oci_core_instance.amd_micro_instances[i].shape
-        ocpus            = 1
-        memory_gb        = 1
-        boot_volume_gb   = local.amd_micro_boot_volume_size_gb
-        ssh_command      = "ssh -i ./ssh_keys/id_rsa ubuntu@\${oci_core_instance.amd_micro_instances[i].public_ip}"
-        state            = oci_core_instance.amd_micro_instances[i].state
-      }
-    ] : []
-    total_instances = local.amd_micro_instance_count
-    total_ocpus     = local.amd_micro_instance_count
-    total_memory_gb = local.amd_micro_instance_count
-    architecture    = "x86_64"
-    note           = local.amd_micro_instance_count > 0 ? "AMD instances configured" : "No AMD instances configured"
-  }
-}
-
-# Network Information
-output "network_summary" {
-  description = "Network configuration summary"
-  value = {
-    vcn_id              = oci_core_vcn.main_vcn.id
-    vcn_cidr_blocks     = oci_core_vcn.main_vcn.cidr_blocks
-    vcn_ipv6_cidr_blocks = oci_core_vcn.main_vcn.ipv6cidr_blocks
-    subnet_id           = oci_core_subnet.main_subnet.id
-    subnet_cidr_block   = oci_core_subnet.main_subnet.cidr_block
-    internet_gateway_id = oci_core_internet_gateway.main_internet_gateway.id
-    security_list_id    = oci_core_default_security_list.main_security_list.id
-  }
-}
-
-# Complete Infrastructure Summary
-output "infrastructure_complete_summary" {
-  description = "Complete infrastructure summary with all resources"
-  value = {
-    region                = local.region
-    availability_domain   = data.oci_identity_availability_domains.ads.availability_domains[0].name
-    compartment_id        = local.compartment_id
-    total_instances       = local.amd_micro_instance_count + local.arm_flex_instance_count
-    amd_instances         = local.amd_micro_instance_count
-    arm_instances         = local.arm_flex_instance_count
-    total_storage_gb      = (local.amd_micro_instance_count * local.amd_micro_boot_volume_size_gb) + (local.arm_flex_instance_count > 0 ? sum(local.arm_flex_boot_volume_size_gb) : 0)
-    free_tier_limit_gb    = 200
-    ssh_key_path          = local.ssh_private_key_path
-    setup_complete        = true
-    ready_for_connection  = true
-  }
-}
-EOF
-        print_success "main.tf created successfully"
+fetch_oci_config_values() {
+    print_subheader "Fetching OCI Configuration"
     
-    # Create cloud-init configuration
-    print_status "Creating cloud-init.yaml for instance initialization..."
-    if [ -f "cloud-init.yaml" ]; then
-        cp cloud-init.yaml "cloud-init.yaml.bak.$(date +%Y%m%d_%H%M%S)"
-        print_status "Backed up existing cloud-init.yaml with timestamp"
+    # Tenancy OCID
+    tenancy_ocid=$(grep -oP '(?<=tenancy=).*' ~/.oci/config | head -1)
+    if [ -z "$tenancy_ocid" ]; then
+        print_error "Failed to fetch tenancy OCID from config"
+        return 1
     fi
-        cat > cloud-init.yaml << 'EOF'
-#cloud-config
-# Cloud-init configuration for Oracle Always Free Tier instances
-# Generated by OCI Terraform setup script
-
-hostname: ${hostname}
-fqdn: ${hostname}.example.com
-manage_etc_hosts: true
-
-# Update packages and install essential tools
-package_update: true
-package_upgrade: true
-
-packages:
-  - curl
-  - wget
-  - git
-  - htop
-  - vim
-  - unzip
-  - jq
-  - docker.io
-  - docker-compose
-  - nginx
-  - python3
-  - python3-pip
-  - nodejs
-  - npm
-
-# Enable and start services
-runcmd:
-  - systemctl enable docker
-  - systemctl start docker
-  - usermod -aG docker ubuntu
-  - systemctl enable nginx
-  - systemctl start nginx
-  - echo "Instance ${hostname} initialized successfully" > /var/log/cloud-init-complete.log
-
-# Configure automatic security updates
-write_files:
-  - path: /etc/apt/apt.conf.d/20auto-upgrades
-    content: |
-      APT::Periodic::Update-Package-Lists "1";
-      APT::Periodic::Unattended-Upgrade "1";
-
-# Set timezone
-timezone: UTC
-
-# Configure SSH
-ssh_pwauth: false
-disable_root: true
-
-# Final message
-final_message: "Oracle Always Free Tier instance ${hostname} is ready!"
-EOF
-        print_success "cloud-init.yaml created successfully"
+    print_status "Tenancy OCID: $tenancy_ocid"
     
-    # Create missing block volume resources
-    print_status "Creating block_volumes.tf with required block volume resources..."
-    if [ -f "block_volumes.tf" ]; then
-        cp block_volumes.tf "block_volumes.tf.bak.$(date +%Y%m%d_%H%M%S)"
-        print_status "Backed up existing block_volumes.tf with timestamp"
+    # User OCID
+    user_ocid=$(grep -P '^\s*user\s*=' ~/.oci/config | sed -E 's/^\s*user\s*=\s*//' | head -1)
+    if [ -z "$user_ocid" ]; then
+        # Try to get from API for session token auth
+        local user_info
+        user_info=$(oci_cmd "iam user list --compartment-id $tenancy_ocid --limit 1")
+        user_ocid=$(safe_jq "$user_info" '.data[0].id')
     fi
-        cat > block_volumes.tf << EOF
-# Block Volume resources for Oracle Always Free Tier
-# Generated on: $(date)
-# Note: Block volumes are included but set to 0 by default for optimal performance
-# Boot volumes are faster than block volumes, so we allocate all 200GB to boot volumes by default
-
-# AMD Block Volumes (only created when size > 0)
-resource "oci_core_volume" "amd_block_volume" {
-  count = local.amd_block_volume_size_gb > 0 ? local.amd_micro_instance_count : 0
-  
-  compartment_id      = local.tenancy_ocid
-  availability_domain = data.oci_identity_availability_domains.ads.availability_domains[0].name
-  display_name        = "\${local.amd_micro_hostnames[count.index]}-block-volume"
-  size_in_gbs         = local.amd_block_volume_size_gb
-  
-  freeform_tags = {
-    "Purpose"      = "AlwaysFreeTierMaximization"
-    "InstanceType" = "AMD-x86-AlwaysFree"
-    "VolumeType"   = "Block"
-    "AttachedTo"   = local.amd_micro_hostnames[count.index]
-  }
-}
-
-# ARM Block Volumes (only created when size > 0)
-resource "oci_core_volume" "arm_block_volume" {
-  count = local.arm_flex_instance_count > 0 ? length([for size in local.arm_block_volume_sizes : size if size > 0]) : 0
-  
-  compartment_id      = local.tenancy_ocid
-  availability_domain = data.oci_identity_availability_domains.ads.availability_domains[0].name
-  display_name        = "\${local.arm_flex_hostnames[count.index]}-block-volume"
-  size_in_gbs         = [for size in local.arm_block_volume_sizes : size if size > 0][count.index]
-  
-  freeform_tags = {
-    "Purpose"      = "AlwaysFreeTierMaximization"
-    "InstanceType" = "ARM-A1-AlwaysFree"
-    "VolumeType"   = "Block"
-    "AttachedTo"   = local.arm_flex_hostnames[count.index]
-  }
-}
-
-# Output Block Volume information
-output "block_volumes_complete_summary" {
-  description = "Complete Block Volume details and usage"
-  value = {
-    amd_block_volumes = local.amd_block_volume_size_gb > 0 ? [
-      for i in range(local.amd_micro_instance_count) : {
-        instance_name = local.amd_micro_hostnames[i]
-        volume_id     = oci_core_volume.amd_block_volume[i].id
-        size_gb       = local.amd_block_volume_size_gb
-        display_name  = oci_core_volume.amd_block_volume[i].display_name
-      }
-    ] : []
-    arm_block_volumes = local.arm_flex_instance_count > 0 ? [
-      for i in range(length(oci_core_volume.arm_block_volume)) : {
-        instance_name = local.arm_flex_hostnames[i]
-        volume_id     = oci_core_volume.arm_block_volume[i].id
-        size_gb       = [for size in local.arm_block_volume_sizes : size if size > 0][i]
-        display_name  = oci_core_volume.arm_block_volume[i].display_name
-      }
-    ] : []
-    total_block_volume_gb = local.total_block_volume_gb
-    optimization_note     = "Block volumes set to 0 by default for optimal performance (boot volumes are faster)"
-  }
-}
-EOF
-        print_success "block_volumes.tf created successfully"
+    print_status "User OCID: ${user_ocid:-N/A (session token auth)}"
     
-    print_success "All Terraform resources created/updated successfully!"
-    print_status "Created/Updated files:"
-    print_status "  - data_sources.tf (availability domains and other required data sources)"
-    print_status "  - main.tf (complete infrastructure configuration with fixed IPv6 settings)"
-    print_status "  - cloud-init.yaml (instance initialization script)"
-    print_status "  - block_volumes.tf (block volume resources for AMD and ARM instances)"
-    print_status "  - provider.tf (OCI provider configuration)"
-    print_status "  - variables.tf (core Always Free Tier configuration)"
+    # Region
+    region=$(grep -oP '(?<=region=).*' ~/.oci/config | head -1)
+    if [ -z "$region" ]; then
+        print_error "Failed to fetch region from config"
+        return 1
+    fi
+    print_status "Region: $region"
+    
+    # Fingerprint (only for API key auth)
+    if [ "$auth_method" = "security_token" ]; then
+        fingerprint="session_token_auth"
+    else
+        fingerprint=$(grep -oP '(?<=fingerprint=).*' ~/.oci/config | head -1)
+    fi
+    print_debug "Auth fingerprint: $fingerprint"
+    
+    print_success "OCI configuration values fetched"
 }
 
-# Function to create Terraform provider configuration
+fetch_availability_domains() {
+    print_status "Fetching availability domains..."
+    
+    local ad_list
+    ad_list=$(oci_cmd "iam availability-domain list --compartment-id $tenancy_ocid --query 'data[].name' --raw-output")
+    
+    if [ -z "$ad_list" ] || [ "$ad_list" = "null" ]; then
+        print_error "Failed to fetch availability domains"
+        return 1
+    fi
+    
+    # Parse first AD
+    availability_domain=$(echo "$ad_list" | jq -r '.[0]' 2>/dev/null)
+    
+    if [ -z "$availability_domain" ] || [ "$availability_domain" = "null" ]; then
+        print_error "Failed to parse availability domain"
+        return 1
+    fi
+    
+    print_success "Availability domain: $availability_domain"
+}
+
+fetch_ubuntu_images() {
+    print_status "Fetching Ubuntu images for region $region..."
+    
+    # Fetch x86 (AMD64) Ubuntu image
+    print_status "  Looking for x86 Ubuntu image..."
+    local x86_images
+    x86_images=$(oci_cmd "compute image list \
+        --compartment-id $tenancy_ocid \
+        --operating-system 'Canonical Ubuntu' \
+        --shape '$FREE_TIER_AMD_SHAPE' \
+        --sort-by TIMECREATED \
+        --sort-order DESC \
+        --query 'data[].{id:id,name:\"display-name\"}' \
+        --all")
+    
+    ubuntu_image_ocid=$(safe_jq "$x86_images" '.[0].id')
+    local x86_name
+    x86_name=$(safe_jq "$x86_images" '.[0].name')
+    
+    if [ -n "$ubuntu_image_ocid" ] && [ "$ubuntu_image_ocid" != "null" ]; then
+        print_success "  x86 image: $x86_name"
+        print_debug "  x86 OCID: $ubuntu_image_ocid"
+    else
+        print_warning "  No x86 Ubuntu image found - AMD instances disabled"
+        ubuntu_image_ocid=""
+    fi
+    
+    # Fetch ARM Ubuntu image
+    print_status "  Looking for ARM Ubuntu image..."
+    local arm_images
+    arm_images=$(oci_cmd "compute image list \
+        --compartment-id $tenancy_ocid \
+        --operating-system 'Canonical Ubuntu' \
+        --shape '$FREE_TIER_ARM_SHAPE' \
+        --sort-by TIMECREATED \
+        --sort-order DESC \
+        --query 'data[].{id:id,name:\"display-name\"}' \
+        --all")
+    
+    ubuntu_arm_flex_image_ocid=$(safe_jq "$arm_images" '.[0].id')
+    local arm_name
+    arm_name=$(safe_jq "$arm_images" '.[0].name')
+    
+    if [ -n "$ubuntu_arm_flex_image_ocid" ] && [ "$ubuntu_arm_flex_image_ocid" != "null" ]; then
+        print_success "  ARM image: $arm_name"
+        print_debug "  ARM OCID: $ubuntu_arm_flex_image_ocid"
+    else
+        print_warning "  No ARM Ubuntu image found - ARM instances disabled"
+        ubuntu_arm_flex_image_ocid=""
+    fi
+}
+
+generate_ssh_keys() {
+    print_status "Setting up SSH keys..."
+    
+    local ssh_dir="$PWD/ssh_keys"
+    mkdir -p "$ssh_dir"
+    
+    if [ ! -f "$ssh_dir/id_rsa" ]; then
+        print_status "Generating new SSH key pair..."
+        ssh-keygen -t rsa -b 4096 -f "$ssh_dir/id_rsa" -N "" -q
+        chmod 600 "$ssh_dir/id_rsa"
+        chmod 644 "$ssh_dir/id_rsa.pub"
+        print_success "SSH key pair generated at $ssh_dir/"
+    else
+        print_status "Using existing SSH key pair at $ssh_dir/"
+    fi
+    
+    # shellcheck disable=SC2034  # exported for Terraform/template consumption
+    ssh_public_key=$(cat "$ssh_dir/id_rsa.pub")
+}
+
+# ============================================================================
+# COMPREHENSIVE RESOURCE INVENTORY
+# ============================================================================
+
+inventory_all_resources() {
+    print_header "COMPREHENSIVE RESOURCE INVENTORY"
+    print_status "Scanning all existing OCI resources in tenancy..."
+    print_status "This ensures we never create duplicate resources."
+    echo ""
+    
+    inventory_compute_instances
+    inventory_networking_resources
+    inventory_storage_resources
+    
+    display_resource_inventory
+}
+
+inventory_compute_instances() {
+    print_status "Inventorying compute instances..."
+    
+    # Get ALL instances (including terminated for awareness)
+    local all_instances
+    all_instances=$(oci_cmd "compute instance list \
+        --compartment-id $tenancy_ocid \
+        --query 'data[?\"lifecycle-state\"!=\`TERMINATED\`].{id:id,name:\"display-name\",state:\"lifecycle-state\",shape:shape,ad:\"availability-domain\",created:\"time-created\"}' \
+        --all" 2>/dev/null) || all_instances="[]"
+    
+    if [ -z "$all_instances" ] || [ "$all_instances" = "null" ]; then
+        all_instances="[]"
+    fi
+    
+    # Clear existing tracking
+    EXISTING_AMD_INSTANCES=()
+    EXISTING_ARM_INSTANCES=()
+    
+    local instance_count
+    instance_count=$(echo "$all_instances" | jq 'length' 2>/dev/null) || instance_count=0
+    
+    if [ "$instance_count" -eq 0 ]; then
+        print_status "  No existing compute instances found"
+        return 0
+    fi
+    
+    # Parse each instance
+    while IFS= read -r instance; do
+        local id name state shape
+        id=$(safe_jq "$instance" '.id')
+        name=$(safe_jq "$instance" '.name')
+        state=$(safe_jq "$instance" '.state')
+        shape=$(safe_jq "$instance" '.shape')
+        
+        if [ -z "$id" ] || [ "$id" = "null" ]; then
+            continue
+        fi
+        
+        # Get VNIC information for IP addresses
+        local vnic_attachments public_ip private_ip
+        vnic_attachments=$(oci_cmd "compute vnic-attachment list \
+            --compartment-id $tenancy_ocid \
+            --instance-id $id \
+            --query 'data[?\"lifecycle-state\"==\`ATTACHED\`]'" 2>/dev/null) || vnic_attachments="[]"
+        
+        if [ -n "$vnic_attachments" ] && [ "$vnic_attachments" != "[]" ] && [ "$vnic_attachments" != "null" ]; then
+            local vnic_id
+            vnic_id=$(safe_jq "$vnic_attachments" '.[0]."vnic-id"')
+            
+            if [ -n "$vnic_id" ] && [ "$vnic_id" != "null" ]; then
+                local vnic_details
+                vnic_details=$(oci_cmd "network vnic get --vnic-id $vnic_id" 2>/dev/null)
+                public_ip=$(safe_jq "$vnic_details" '.data."public-ip"' "none")
+                private_ip=$(safe_jq "$vnic_details" '.data."private-ip"' "none")
+            fi
+        fi
+        
+        # Categorize by shape
+        if [ "$shape" = "$FREE_TIER_AMD_SHAPE" ]; then
+            EXISTING_AMD_INSTANCES["$id"]="$name|$state|$shape|${public_ip:-none}|${private_ip:-none}"
+            print_status "  Found AMD instance: $name ($state) - IP: ${public_ip:-none}"
+        elif [ "$shape" = "$FREE_TIER_ARM_SHAPE" ]; then
+            # Get shape config for ARM instances
+            local instance_details ocpus memory
+            instance_details=$(oci_cmd "compute instance get --instance-id $id" 2>/dev/null)
+            ocpus=$(safe_jq "$instance_details" '.data."shape-config".ocpus' "0")
+            memory=$(safe_jq "$instance_details" '.data."shape-config"."memory-in-gbs"' "0")
+            
+            EXISTING_ARM_INSTANCES["$id"]="$name|$state|$shape|${public_ip:-none}|${private_ip:-none}|$ocpus|$memory"
+            print_status "  Found ARM instance: $name ($state, ${ocpus}OCPUs, ${memory}GB) - IP: ${public_ip:-none}"
+        else
+            print_debug "  Found non-free-tier instance: $name ($shape)"
+        fi
+    done <<< "$(echo "$all_instances" | jq -c '.[]' 2>/dev/null)"
+    
+    print_status "  AMD instances: ${#EXISTING_AMD_INSTANCES[@]}/${FREE_TIER_MAX_AMD_INSTANCES}"
+    print_status "  ARM instances: ${#EXISTING_ARM_INSTANCES[@]}/${FREE_TIER_MAX_ARM_INSTANCES}"
+}
+
+inventory_networking_resources() {
+    print_status "Inventorying networking resources..."
+    
+    # Clear existing tracking
+    EXISTING_VCNS=()
+    EXISTING_SUBNETS=()
+    EXISTING_INTERNET_GATEWAYS=()
+    EXISTING_ROUTE_TABLES=()
+    EXISTING_SECURITY_LISTS=()
+    
+    # Get VCNs
+    local vcn_list
+    vcn_list=$(oci_cmd "network vcn list \
+        --compartment-id $tenancy_ocid \
+        --query 'data[?\"lifecycle-state\"==\`AVAILABLE\`].{id:id,name:\"display-name\",cidr:\"cidr-block\"}' \
+        --all" 2>/dev/null) || vcn_list="[]"
+    
+    if [ -z "$vcn_list" ] || [ "$vcn_list" = "null" ]; then
+        vcn_list="[]"
+    fi
+    
+    while IFS= read -r vcn; do
+        local vcn_id vcn_name vcn_cidr
+        vcn_id=$(safe_jq "$vcn" '.id')
+        vcn_name=$(safe_jq "$vcn" '.name')
+        vcn_cidr=$(safe_jq "$vcn" '.cidr')
+        
+        if [ -z "$vcn_id" ] || [ "$vcn_id" = "null" ]; then
+            continue
+        fi
+        
+        EXISTING_VCNS["$vcn_id"]="$vcn_name|$vcn_cidr"
+        print_status "  Found VCN: $vcn_name ($vcn_cidr)"
+        
+        # Get subnets for this VCN
+        local subnet_list
+        subnet_list=$(oci_cmd "network subnet list \
+            --compartment-id $tenancy_ocid \
+            --vcn-id $vcn_id \
+            --query 'data[?\"lifecycle-state\"==\`AVAILABLE\`].{id:id,name:\"display-name\",cidr:\"cidr-block\"}'" 2>/dev/null) || subnet_list="[]"
+        
+        while IFS= read -r subnet; do
+            local subnet_id subnet_name subnet_cidr
+            subnet_id=$(safe_jq "$subnet" '.id')
+            subnet_name=$(safe_jq "$subnet" '.name')
+            subnet_cidr=$(safe_jq "$subnet" '.cidr')
+            
+            if [ -n "$subnet_id" ] && [ "$subnet_id" != "null" ]; then
+                EXISTING_SUBNETS["$subnet_id"]="$subnet_name|$subnet_cidr|$vcn_id"
+                print_debug "    Subnet: $subnet_name ($subnet_cidr)"
+            fi
+        done <<< "$(echo "$subnet_list" | jq -c '.[]' 2>/dev/null)"
+        
+        # Get internet gateways
+        local ig_list
+        ig_list=$(oci_cmd "network internet-gateway list \
+            --compartment-id $tenancy_ocid \
+            --vcn-id $vcn_id \
+            --query 'data[?\"lifecycle-state\"==\`AVAILABLE\`].{id:id,name:\"display-name\"}'" 2>/dev/null) || ig_list="[]"
+        
+        while IFS= read -r ig; do
+            local ig_id ig_name
+            ig_id=$(safe_jq "$ig" '.id')
+            ig_name=$(safe_jq "$ig" '.name')
+            
+            if [ -n "$ig_id" ] && [ "$ig_id" != "null" ]; then
+                EXISTING_INTERNET_GATEWAYS["$ig_id"]="$ig_name|$vcn_id"
+            fi
+        done <<< "$(echo "$ig_list" | jq -c '.[]' 2>/dev/null)"
+        
+        # Get route tables
+        local rt_list
+        rt_list=$(oci_cmd "network route-table list \
+            --compartment-id $tenancy_ocid \
+            --vcn-id $vcn_id \
+            --query 'data[].{id:id,name:\"display-name\"}'" 2>/dev/null) || rt_list="[]"
+        
+        while IFS= read -r rt; do
+            local rt_id rt_name
+            rt_id=$(safe_jq "$rt" '.id')
+            rt_name=$(safe_jq "$rt" '.name')
+            
+            if [ -n "$rt_id" ] && [ "$rt_id" != "null" ]; then
+                EXISTING_ROUTE_TABLES["$rt_id"]="$rt_name|$vcn_id"
+            fi
+        done <<< "$(echo "$rt_list" | jq -c '.[]' 2>/dev/null)"
+        
+        # Get security lists
+        local sl_list
+        sl_list=$(oci_cmd "network security-list list \
+            --compartment-id $tenancy_ocid \
+            --vcn-id $vcn_id \
+            --query 'data[].{id:id,name:\"display-name\"}'" 2>/dev/null) || sl_list="[]"
+        
+        while IFS= read -r sl; do
+            local sl_id sl_name
+            sl_id=$(safe_jq "$sl" '.id')
+            sl_name=$(safe_jq "$sl" '.name')
+            
+            if [ -n "$sl_id" ] && [ "$sl_id" != "null" ]; then
+                EXISTING_SECURITY_LISTS["$sl_id"]="$sl_name|$vcn_id"
+            fi
+        done <<< "$(echo "$sl_list" | jq -c '.[]' 2>/dev/null)"
+        
+    done <<< "$(echo "$vcn_list" | jq -c '.[]' 2>/dev/null)"
+    
+    print_status "  VCNs: ${#EXISTING_VCNS[@]}/${FREE_TIER_MAX_VCNS}"
+    print_status "  Subnets: ${#EXISTING_SUBNETS[@]}"
+    print_status "  Internet Gateways: ${#EXISTING_INTERNET_GATEWAYS[@]}"
+}
+
+inventory_storage_resources() {
+    print_status "Inventorying storage resources..."
+    
+    EXISTING_BOOT_VOLUMES=()
+    EXISTING_BLOCK_VOLUMES=()
+    
+    # Get boot volumes
+    local boot_list
+    boot_list=$(oci_cmd "bv boot-volume list \
+        --compartment-id $tenancy_ocid \
+        --availability-domain $availability_domain \
+        --query 'data[?\"lifecycle-state\"==\`AVAILABLE\`].{id:id,name:\"display-name\",size:\"size-in-gbs\"}' \
+        --all" 2>/dev/null) || boot_list="[]"
+    
+    local total_boot_gb=0
+    
+    while IFS= read -r boot; do
+        local boot_id boot_name boot_size
+        boot_id=$(safe_jq "$boot" '.id')
+        boot_name=$(safe_jq "$boot" '.name')
+        boot_size=$(safe_jq "$boot" '.size' "0")
+        
+        if [ -n "$boot_id" ] && [ "$boot_id" != "null" ]; then
+            EXISTING_BOOT_VOLUMES["$boot_id"]="$boot_name|$boot_size"
+            total_boot_gb=$((total_boot_gb + boot_size))
+        fi
+    done <<< "$(echo "$boot_list" | jq -c '.[]' 2>/dev/null)"
+    
+    # Get block volumes
+    local block_list
+    block_list=$(oci_cmd "bv volume list \
+        --compartment-id $tenancy_ocid \
+        --availability-domain $availability_domain \
+        --query 'data[?\"lifecycle-state\"==\`AVAILABLE\`].{id:id,name:\"display-name\",size:\"size-in-gbs\"}' \
+        --all" 2>/dev/null) || block_list="[]"
+    
+    local total_block_gb=0
+    
+    while IFS= read -r block; do
+        local block_id block_name block_size
+        block_id=$(safe_jq "$block" '.id')
+        block_name=$(safe_jq "$block" '.name')
+        block_size=$(safe_jq "$block" '.size' "0")
+        
+        if [ -n "$block_id" ] && [ "$block_id" != "null" ]; then
+            EXISTING_BLOCK_VOLUMES["$block_id"]="$block_name|$block_size"
+            total_block_gb=$((total_block_gb + block_size))
+        fi
+    done <<< "$(echo "$block_list" | jq -c '.[]' 2>/dev/null)"
+    
+    local total_storage=$((total_boot_gb + total_block_gb))
+    
+    print_status "  Boot volumes: ${#EXISTING_BOOT_VOLUMES[@]} (${total_boot_gb}GB)"
+    print_status "  Block volumes: ${#EXISTING_BLOCK_VOLUMES[@]} (${total_block_gb}GB)"
+    print_status "  Total storage: ${total_storage}GB/${FREE_TIER_MAX_STORAGE_GB}GB"
+}
+
+display_resource_inventory() {
+    echo ""
+    print_header "RESOURCE INVENTORY SUMMARY"
+    
+    # Calculate totals
+    local total_amd=${#EXISTING_AMD_INSTANCES[@]}
+    local total_arm=${#EXISTING_ARM_INSTANCES[@]}
+    local total_arm_ocpus=0
+    local total_arm_memory=0
+    
+    for instance_data in "${EXISTING_ARM_INSTANCES[@]}"; do
+        local ocpus memory
+        ocpus=$(echo "$instance_data" | cut -d'|' -f6)
+        memory=$(echo "$instance_data" | cut -d'|' -f7)
+        total_arm_ocpus=$((total_arm_ocpus + ocpus))
+        total_arm_memory=$((total_arm_memory + memory))
+    done
+    
+    local total_boot_gb=0
+    for boot_data in "${EXISTING_BOOT_VOLUMES[@]}"; do
+        local size
+        size=$(echo "$boot_data" | cut -d'|' -f2)
+        total_boot_gb=$((total_boot_gb + size))
+    done
+    
+    local total_block_gb=0
+    for block_data in "${EXISTING_BLOCK_VOLUMES[@]}"; do
+        local size
+        size=$(echo "$block_data" | cut -d'|' -f2)
+        total_block_gb=$((total_block_gb + size))
+    done
+    
+    local total_storage=$((total_boot_gb + total_block_gb))
+    
+    echo -e "${BOLD}Compute Resources:${NC}"
+    echo "  ┌─────────────────────────────────────────────────────────────┐"
+    echo "  │ AMD Micro Instances:  $total_amd / $FREE_TIER_MAX_AMD_INSTANCES (Free Tier limit)          │"
+    echo "  │ ARM A1 Instances:     $total_arm / $FREE_TIER_MAX_ARM_INSTANCES (up to)                    │"
+    echo "  │ ARM OCPUs Used:       $total_arm_ocpus / $FREE_TIER_MAX_ARM_OCPUS                           │"
+    echo "  │ ARM Memory Used:      ${total_arm_memory}GB / ${FREE_TIER_MAX_ARM_MEMORY_GB}GB                         │"
+    echo "  └─────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo -e "${BOLD}Storage Resources:${NC}"
+    echo "  ┌─────────────────────────────────────────────────────────────┐"
+    echo "  │ Boot Volumes:         ${total_boot_gb}GB                                    │"
+    echo "  │ Block Volumes:        ${total_block_gb}GB                                    │"
+    printf "  │ Total Storage:        %3dGB / %3dGB Free Tier limit          │\n" "$total_storage" "$FREE_TIER_MAX_STORAGE_GB"
+    echo "  └─────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo -e "${BOLD}Networking Resources:${NC}"
+    echo "  ┌─────────────────────────────────────────────────────────────┐"
+    echo "  │ VCNs:                 ${#EXISTING_VCNS[@]} / $FREE_TIER_MAX_VCNS (Free Tier limit)             │"
+    echo "  │ Subnets:              ${#EXISTING_SUBNETS[@]}                                       │"
+    echo "  │ Internet Gateways:    ${#EXISTING_INTERNET_GATEWAYS[@]}                                       │"
+    echo "  └─────────────────────────────────────────────────────────────┘"
+    echo ""
+    
+    # Warnings for near-limit resources
+    if [ "$total_amd" -ge "$FREE_TIER_MAX_AMD_INSTANCES" ]; then
+        print_warning "AMD instance limit reached - cannot create more AMD instances"
+    fi
+    if [ "$total_arm_ocpus" -ge "$FREE_TIER_MAX_ARM_OCPUS" ]; then
+        print_warning "ARM OCPU limit reached - cannot allocate more ARM OCPUs"
+    fi
+    if [ "$total_arm_memory" -ge "$FREE_TIER_MAX_ARM_MEMORY_GB" ]; then
+        print_warning "ARM memory limit reached - cannot allocate more ARM memory"
+    fi
+    if [ "$total_storage" -ge "$FREE_TIER_MAX_STORAGE_GB" ]; then
+        print_warning "Storage limit reached - cannot create more volumes"
+    fi
+    if [ "${#EXISTING_VCNS[@]}" -ge "$FREE_TIER_MAX_VCNS" ]; then
+        print_warning "VCN limit reached - cannot create more VCNs"
+    fi
+}
+
+# ============================================================================
+# FREE TIER LIMIT VALIDATION
+# ============================================================================
+
+calculate_available_resources() {
+    # Calculate what's still available within Free Tier limits
+    local used_amd=${#EXISTING_AMD_INSTANCES[@]}
+    local used_arm_ocpus=0
+    local used_arm_memory=0
+    local used_storage=0
+    
+    for instance_data in "${EXISTING_ARM_INSTANCES[@]}"; do
+        local ocpus memory
+        ocpus=$(echo "$instance_data" | cut -d'|' -f6)
+        memory=$(echo "$instance_data" | cut -d'|' -f7)
+        used_arm_ocpus=$((used_arm_ocpus + ocpus))
+        used_arm_memory=$((used_arm_memory + memory))
+    done
+    
+    for boot_data in "${EXISTING_BOOT_VOLUMES[@]}"; do
+        local size
+        size=$(echo "$boot_data" | cut -d'|' -f2)
+        used_storage=$((used_storage + size))
+    done
+    
+    for block_data in "${EXISTING_BLOCK_VOLUMES[@]}"; do
+        local size
+        size=$(echo "$block_data" | cut -d'|' -f2)
+        used_storage=$((used_storage + size))
+    done
+    
+    # Export available resources
+    export AVAILABLE_AMD_INSTANCES=$((FREE_TIER_MAX_AMD_INSTANCES - used_amd))
+    export AVAILABLE_ARM_OCPUS=$((FREE_TIER_MAX_ARM_OCPUS - used_arm_ocpus))
+    export AVAILABLE_ARM_MEMORY=$((FREE_TIER_MAX_ARM_MEMORY_GB - used_arm_memory))
+    export AVAILABLE_STORAGE=$((FREE_TIER_MAX_STORAGE_GB - used_storage))
+    export USED_ARM_INSTANCES=${#EXISTING_ARM_INSTANCES[@]}
+    
+    print_debug "Available: AMD=$AVAILABLE_AMD_INSTANCES, ARM_OCPU=$AVAILABLE_ARM_OCPUS, ARM_MEM=$AVAILABLE_ARM_MEMORY, Storage=$AVAILABLE_STORAGE"
+}
+
+validate_proposed_config() {
+    local proposed_amd=$1
+    # shellcheck disable=SC2034  # keep argument for future checks
+    local proposed_arm=$2
+    local proposed_arm_ocpus=$3
+    local proposed_arm_memory=$4
+    local proposed_storage=$5
+    
+    local errors=0
+    
+    if [ "$proposed_amd" -gt "$AVAILABLE_AMD_INSTANCES" ]; then
+        print_error "Cannot create $proposed_amd AMD instances - only $AVAILABLE_AMD_INSTANCES available"
+        errors=$((errors + 1))
+    fi
+    
+    if [ "$proposed_arm_ocpus" -gt "$AVAILABLE_ARM_OCPUS" ]; then
+        print_error "Cannot allocate $proposed_arm_ocpus ARM OCPUs - only $AVAILABLE_ARM_OCPUS available"
+        errors=$((errors + 1))
+    fi
+    
+    if [ "$proposed_arm_memory" -gt "$AVAILABLE_ARM_MEMORY" ]; then
+        print_error "Cannot allocate ${proposed_arm_memory}GB ARM memory - only ${AVAILABLE_ARM_MEMORY}GB available"
+        errors=$((errors + 1))
+    fi
+    
+    if [ "$proposed_storage" -gt "$AVAILABLE_STORAGE" ]; then
+        print_error "Cannot use ${proposed_storage}GB storage - only ${AVAILABLE_STORAGE}GB available"
+        errors=$((errors + 1))
+    fi
+    
+    return $errors
+}
+
+# ============================================================================
+# CONFIGURATION FUNCTIONS
+# ============================================================================
+
+load_existing_config() {
+    if [ ! -f "variables.tf" ]; then
+        return 1
+    fi
+    
+    print_status "Loading existing configuration from variables.tf..."
+    
+    # Load basic counts
+    amd_micro_instance_count=$(grep -oP 'amd_micro_instance_count\s*=\s*\K[0-9]+' variables.tf 2>/dev/null | head -1) || amd_micro_instance_count=0
+    amd_micro_boot_volume_size_gb=$(grep -oP 'amd_micro_boot_volume_size_gb\s*=\s*\K[0-9]+' variables.tf 2>/dev/null | head -1) || amd_micro_boot_volume_size_gb=50
+    arm_flex_instance_count=$(grep -oP 'arm_flex_instance_count\s*=\s*\K[0-9]+' variables.tf 2>/dev/null | head -1) || arm_flex_instance_count=0
+    
+    # Load ARM arrays
+    local ocpus_str memory_str boot_str
+    ocpus_str=$(grep -oP 'arm_flex_ocpus_per_instance\s*=\s*\[\K[^\]]+' variables.tf 2>/dev/null | head -1) || ocpus_str=""
+    memory_str=$(grep -oP 'arm_flex_memory_per_instance\s*=\s*\[\K[^\]]+' variables.tf 2>/dev/null | head -1) || memory_str=""
+    boot_str=$(grep -oP 'arm_flex_boot_volume_size_gb\s*=\s*\[\K[^\]]+' variables.tf 2>/dev/null | head -1) || boot_str=""
+    
+    arm_flex_ocpus_per_instance=$(echo "$ocpus_str" | tr ',' ' ' | tr -s ' ')
+    arm_flex_memory_per_instance=$(echo "$memory_str" | tr ',' ' ' | tr -s ' ')
+    arm_flex_boot_volume_size_gb=$(echo "$boot_str" | tr ',' ' ' | tr -s ' ')
+    
+    # Load hostnames
+    local amd_hostnames_str arm_hostnames_str
+    amd_hostnames_str=$(grep -oP 'amd_micro_hostnames\s*=\s*\[\K[^\]]+' variables.tf 2>/dev/null | head -1) || amd_hostnames_str=""
+    arm_hostnames_str=$(grep -oP 'arm_flex_hostnames\s*=\s*\[\K[^\]]+' variables.tf 2>/dev/null | head -1) || arm_hostnames_str=""
+    
+    amd_micro_hostnames=()
+    arm_flex_hostnames=()
+    
+    if [ -n "$amd_hostnames_str" ]; then
+        while IFS= read -r hostname; do
+            hostname=$(echo "$hostname" | tr -d '"' | tr -d ' ')
+            [ -n "$hostname" ] && amd_micro_hostnames+=("$hostname")
+        done <<< "$(echo "$amd_hostnames_str" | tr ',' '\n')"
+    fi
+    
+    if [ -n "$arm_hostnames_str" ]; then
+        while IFS= read -r hostname; do
+            hostname=$(echo "$hostname" | tr -d '"' | tr -d ' ')
+            [ -n "$hostname" ] && arm_flex_hostnames+=("$hostname")
+        done <<< "$(echo "$arm_hostnames_str" | tr ',' '\n')"
+    fi
+    
+    print_success "Loaded configuration: ${amd_micro_instance_count}x AMD, ${arm_flex_instance_count}x ARM"
+    return 0
+}
+
+prompt_configuration() {
+    print_header "INSTANCE CONFIGURATION"
+    
+    calculate_available_resources
+    
+    echo -e "${BOLD}Available Free Tier Resources:${NC}"
+    echo "  • AMD instances:  $AVAILABLE_AMD_INSTANCES available (max $FREE_TIER_MAX_AMD_INSTANCES)"
+    echo "  • ARM OCPUs:      $AVAILABLE_ARM_OCPUS available (max $FREE_TIER_MAX_ARM_OCPUS)"
+    echo "  • ARM Memory:     ${AVAILABLE_ARM_MEMORY}GB available (max ${FREE_TIER_MAX_ARM_MEMORY_GB}GB)"
+    echo "  • Storage:        ${AVAILABLE_STORAGE}GB available (max ${FREE_TIER_MAX_STORAGE_GB}GB)"
+    echo ""
+    
+    # Check if we have existing config
+    local has_existing_config=false
+    if load_existing_config; then
+        has_existing_config=true
+    fi
+    
+    print_status "Configuration options:"
+    echo "  1) Use existing instances (manage what's already deployed)"
+    if [ "$has_existing_config" = "true" ]; then
+        echo "  2) Use saved configuration from variables.tf"
+    fi
+    echo "  3) Configure new instances (respecting Free Tier limits)"
+    echo "  4) Maximum Free Tier configuration (use all available resources)"
+    echo ""
+    
+    local choice
+    while true; do
+        if [ "$AUTO_USE_EXISTING" = "true" ]; then
+            choice=1
+            print_status "Auto mode: Using existing instances"
+        elif [ "$NON_INTERACTIVE" = "true" ]; then
+            choice=1
+            print_status "Non-interactive mode: Using existing instances"
+        else
+            echo -n -e "${BLUE}Choose configuration (1-4): ${NC}"
+            read -r choice
+            choice=${choice:-1}
+        fi
+        
+        case $choice in
+            1)
+                configure_from_existing_instances
+                break
+                ;;
+            2)
+                if [ "$has_existing_config" = "true" ]; then
+                    print_success "Using saved configuration"
+                    break
+                else
+                    print_error "No saved configuration available"
+                    continue
+                fi
+                ;;
+            3)
+                configure_custom_instances
+                break
+                ;;
+            4)
+                configure_maximum_free_tier
+                break
+                ;;
+            *)
+                print_error "Invalid choice"
+                continue
+                ;;
+        esac
+    done
+}
+
+configure_from_existing_instances() {
+    print_status "Configuring based on existing instances..."
+    
+    # Use existing AMD instances
+    amd_micro_instance_count=${#EXISTING_AMD_INSTANCES[@]}
+    amd_micro_hostnames=()
+    
+    for instance_data in "${EXISTING_AMD_INSTANCES[@]}"; do
+        local name
+        name=$(echo "$instance_data" | cut -d'|' -f1)
+        amd_micro_hostnames+=("$name")
+    done
+    
+    # Use existing ARM instances
+    arm_flex_instance_count=${#EXISTING_ARM_INSTANCES[@]}
+    arm_flex_hostnames=()
+    arm_flex_ocpus_per_instance=""
+    arm_flex_memory_per_instance=""
+    arm_flex_boot_volume_size_gb=""
+    arm_flex_block_volumes=()
+    
+    for instance_data in "${EXISTING_ARM_INSTANCES[@]}"; do
+        local name ocpus memory
+        name=$(echo "$instance_data" | cut -d'|' -f1)
+        ocpus=$(echo "$instance_data" | cut -d'|' -f6)
+        memory=$(echo "$instance_data" | cut -d'|' -f7)
+        
+        arm_flex_hostnames+=("$name")
+        arm_flex_ocpus_per_instance+="$ocpus "
+        arm_flex_memory_per_instance+="$memory "
+        arm_flex_boot_volume_size_gb+="50 "  # Default, will be updated from state
+        arm_flex_block_volumes+=(0)
+    done
+    
+    # Trim trailing spaces
+    arm_flex_ocpus_per_instance=$(echo "$arm_flex_ocpus_per_instance" | xargs)
+    arm_flex_memory_per_instance=$(echo "$arm_flex_memory_per_instance" | xargs)
+    arm_flex_boot_volume_size_gb=$(echo "$arm_flex_boot_volume_size_gb" | xargs)
+    
+    # Set defaults if no instances exist
+    if [ "$amd_micro_instance_count" -eq 0 ] && [ "$arm_flex_instance_count" -eq 0 ]; then
+        print_status "No existing instances found, using default configuration"
+        amd_micro_instance_count=0
+        arm_flex_instance_count=1
+        arm_flex_ocpus_per_instance="4"
+        arm_flex_memory_per_instance="24"
+        arm_flex_boot_volume_size_gb="200"
+        arm_flex_hostnames=("arm-instance-1")
+        arm_flex_block_volumes=(0)
+    fi
+    
+    amd_micro_boot_volume_size_gb=50
+    
+    print_success "Configuration: ${amd_micro_instance_count}x AMD, ${arm_flex_instance_count}x ARM"
+}
+
+configure_custom_instances() {
+    print_status "Custom instance configuration..."
+    
+    # AMD instances
+    while true; do
+        echo -n -e "${BLUE}Number of AMD instances (0-$AVAILABLE_AMD_INSTANCES): ${NC}"
+        read -r amd_micro_instance_count
+        amd_micro_instance_count=${amd_micro_instance_count:-0}
+        
+        if [[ "$amd_micro_instance_count" =~ ^[0-9]+$ ]] && \
+           [ "$amd_micro_instance_count" -ge 0 ] && \
+           [ "$amd_micro_instance_count" -le "$AVAILABLE_AMD_INSTANCES" ]; then
+            break
+        fi
+        print_error "Please enter a number between 0 and $AVAILABLE_AMD_INSTANCES"
+    done
+    
+    amd_micro_hostnames=()
+    if [ "$amd_micro_instance_count" -gt 0 ]; then
+        echo -n -e "${BLUE}AMD boot volume size (50-100 GB) [50]: ${NC}"
+        read -r amd_micro_boot_volume_size_gb
+        amd_micro_boot_volume_size_gb=${amd_micro_boot_volume_size_gb:-50}
+        
+        for ((i=1; i<=amd_micro_instance_count; i++)); do
+            echo -n -e "${BLUE}Hostname for AMD instance $i [amd-instance-$i]: ${NC}"
+            read -r hostname
+            hostname=${hostname:-"amd-instance-$i"}
+            amd_micro_hostnames+=("$hostname")
+        done
+    else
+        amd_micro_boot_volume_size_gb=50
+    fi
+    
+    # ARM instances
+    if [ -n "$ubuntu_arm_flex_image_ocid" ] && [ "$AVAILABLE_ARM_OCPUS" -gt 0 ]; then
+        while true; do
+            echo -n -e "${BLUE}Number of ARM instances (0-4): ${NC}"
+            read -r arm_flex_instance_count
+            arm_flex_instance_count=${arm_flex_instance_count:-1}
+            
+            if [[ "$arm_flex_instance_count" =~ ^[0-9]+$ ]] && \
+               [ "$arm_flex_instance_count" -ge 0 ] && \
+               [ "$arm_flex_instance_count" -le 4 ]; then
+                break
+            fi
+            print_error "Please enter a number between 0 and 4"
+        done
+        
+        arm_flex_hostnames=()
+        arm_flex_ocpus_per_instance=""
+        arm_flex_memory_per_instance=""
+        arm_flex_boot_volume_size_gb=""
+        arm_flex_block_volumes=()
+        
+        local remaining_ocpus=$AVAILABLE_ARM_OCPUS
+        local remaining_memory=$AVAILABLE_ARM_MEMORY
+        
+        for ((i=1; i<=arm_flex_instance_count; i++)); do
+            echo ""
+            print_status "ARM instance $i configuration (remaining: ${remaining_ocpus} OCPUs, ${remaining_memory}GB RAM):"
+            
+            echo -n -e "${BLUE}  Hostname [arm-instance-$i]: ${NC}"
+            read -r hostname
+            hostname=${hostname:-"arm-instance-$i"}
+            arm_flex_hostnames+=("$hostname")
+            
+            echo -n -e "${BLUE}  OCPUs (1-$remaining_ocpus): ${NC}"
+            read -r ocpus
+            ocpus=${ocpus:-$remaining_ocpus}
+            arm_flex_ocpus_per_instance+="$ocpus "
+            remaining_ocpus=$((remaining_ocpus - ocpus))
+            
+            local max_memory=$((ocpus * 6))  # 6GB per OCPU max
+            [ $max_memory -gt $remaining_memory ] && max_memory=$remaining_memory
+            
+            echo -n -e "${BLUE}  Memory GB (1-$max_memory): ${NC}"
+            read -r memory
+            memory=${memory:-$max_memory}
+            arm_flex_memory_per_instance+="$memory "
+            remaining_memory=$((remaining_memory - memory))
+            
+            echo -n -e "${BLUE}  Boot volume GB (50-200) [50]: ${NC}"
+            read -r boot
+            boot=${boot:-50}
+            arm_flex_boot_volume_size_gb+="$boot "
+            
+            arm_flex_block_volumes+=(0)
+        done
+        
+        arm_flex_ocpus_per_instance=$(echo "$arm_flex_ocpus_per_instance" | xargs)
+        arm_flex_memory_per_instance=$(echo "$arm_flex_memory_per_instance" | xargs)
+        arm_flex_boot_volume_size_gb=$(echo "$arm_flex_boot_volume_size_gb" | xargs)
+    else
+        arm_flex_instance_count=0
+        arm_flex_ocpus_per_instance=""
+        arm_flex_memory_per_instance=""
+        arm_flex_boot_volume_size_gb=""
+        arm_flex_block_volumes=()
+        arm_flex_hostnames=()
+    fi
+}
+
+configure_maximum_free_tier() {
+    print_status "Configuring maximum Free Tier utilization..."
+    
+    # Use all available AMD instances
+    amd_micro_instance_count=$AVAILABLE_AMD_INSTANCES
+    amd_micro_boot_volume_size_gb=50
+    amd_micro_hostnames=()
+    for ((i=1; i<=amd_micro_instance_count; i++)); do
+        amd_micro_hostnames+=("amd-instance-$i")
+    done
+    
+    # Use all available ARM resources
+    if [ -n "$ubuntu_arm_flex_image_ocid" ] && [ "$AVAILABLE_ARM_OCPUS" -gt 0 ]; then
+        arm_flex_instance_count=1
+        arm_flex_ocpus_per_instance="$AVAILABLE_ARM_OCPUS"
+        arm_flex_memory_per_instance="$AVAILABLE_ARM_MEMORY"
+        
+        # Calculate boot volume size to use remaining storage
+        local used_by_amd=$((amd_micro_instance_count * amd_micro_boot_volume_size_gb))
+        local remaining_storage=$((AVAILABLE_STORAGE - used_by_amd))
+        [ $remaining_storage -lt $FREE_TIER_MIN_BOOT_VOLUME_GB ] && remaining_storage=$FREE_TIER_MIN_BOOT_VOLUME_GB
+        
+        arm_flex_boot_volume_size_gb="$remaining_storage"
+        arm_flex_hostnames=("arm-instance-1")
+        arm_flex_block_volumes=(0)
+    else
+        arm_flex_instance_count=0
+        arm_flex_ocpus_per_instance=""
+        arm_flex_memory_per_instance=""
+        arm_flex_boot_volume_size_gb=""
+        arm_flex_hostnames=()
+        arm_flex_block_volumes=()
+    fi
+    
+    print_success "Maximum config: ${amd_micro_instance_count}x AMD, ${arm_flex_instance_count}x ARM ($AVAILABLE_ARM_OCPUS OCPUs, ${AVAILABLE_ARM_MEMORY}GB)"
+}
+
+# ============================================================================
+# TERRAFORM FILE GENERATION
+# ============================================================================
+
+create_terraform_files() {
+    print_header "GENERATING TERRAFORM FILES"
+    
+    create_terraform_provider
+    create_terraform_variables
+    create_terraform_datasources
+    create_terraform_main
+    create_terraform_block_volumes
+    create_cloud_init
+    
+    print_success "All Terraform files generated successfully"
+}
+
 create_terraform_provider() {
-    print_status "Creating provider.tf with OCI provider configuration..."
+    print_status "Creating provider.tf..."
+
+    # Configure terraform backend if requested (may create backend.tf)
+    configure_terraform_backend || true
     
-    # Backup existing file if it exists
-    if [ -f "provider.tf" ]; then
-        cp provider.tf "provider.tf.bak.$(date +%Y%m%d_%H%M%S)"
-        print_status "Backed up existing provider.tf with timestamp"
-    fi
+    [ -f "provider.tf" ] && cp provider.tf "provider.tf.bak.$(date +%Y%m%d_%H%M%S)"
     
-    # Create provider.tf - Use OCI config file authentication
     cat > provider.tf << EOF
-# Terraform configuration for Oracle Cloud Infrastructure (OCI)
-# Generated on: $(date)
+# Terraform Provider Configuration for Oracle Cloud Infrastructure
+# Generated: $(date)
+# Region: $region
 
 terraform {
   required_version = ">= 1.0"
@@ -2283,221 +1541,928 @@ terraform {
   }
 }
 
-# Configure the Oracle Cloud Infrastructure Provider
-# Uses ~/.oci/config file for authentication with session tokens
+# OCI Provider with session token authentication
 provider "oci" {
   auth                = "SecurityToken"
   config_file_profile = "DEFAULT"
   region              = "$region"
 }
-
-# Optional: Configure provider alias for different regions
-# provider "oci" {
-#   alias               = "us_east_1"
-#   auth                = "SecurityToken"
-#   config_file_profile = "DEFAULT"
-#   region              = "us-ashburn-1"
-# }
 EOF
     
-    print_success "provider.tf created successfully"
-    print_status "Provider configuration:"
-    print_status "  - OCI Provider version: ~> 6.0"
-    print_status "  - Terraform version: >= 1.0"
-    print_status "  - Authentication: OCI config file (~/.oci/config)"
-    print_status "  - Profile: DEFAULT"
+    print_success "provider.tf created"
+}
+
+create_terraform_variables() {
+    print_status "Creating variables.tf..."
+    
+    [ -f "variables.tf" ] && cp variables.tf "variables.tf.bak.$(date +%Y%m%d_%H%M%S)"
+    
+    # Build array strings for Terraform
+    local amd_hostnames_tf="["
+    for ((i=0; i<${#amd_micro_hostnames[@]}; i++)); do
+        [ $i -gt 0 ] && amd_hostnames_tf+=", "
+        amd_hostnames_tf+="\"${amd_micro_hostnames[$i]}\""
+    done
+    amd_hostnames_tf+="]"
+    
+    local arm_hostnames_tf="["
+    for ((i=0; i<${#arm_flex_hostnames[@]}; i++)); do
+        [ $i -gt 0 ] && arm_hostnames_tf+=", "
+        arm_hostnames_tf+="\"${arm_flex_hostnames[$i]}\""
+    done
+    arm_hostnames_tf+="]"
+    
+    local arm_ocpus_tf="["
+    local arm_memory_tf="["
+    local arm_boot_tf="["
+    local arm_block_tf="["
+    
+    if [ "$arm_flex_instance_count" -gt 0 ]; then
+        # Split space-separated strings safely into arrays
+        IFS=' ' read -r -a ocpu_arr <<< "$arm_flex_ocpus_per_instance"
+        IFS=' ' read -r -a memory_arr <<< "$arm_flex_memory_per_instance"
+        IFS=' ' read -r -a boot_arr <<< "$arm_flex_boot_volume_size_gb"
+        
+        for ((i=0; i<${#ocpu_arr[@]}; i++)); do
+            [ $i -gt 0 ] && arm_ocpus_tf+=", " && arm_memory_tf+=", " && arm_boot_tf+=", " && arm_block_tf+=", "
+            arm_ocpus_tf+="${ocpu_arr[$i]}"
+            arm_memory_tf+="${memory_arr[$i]}"
+            arm_boot_tf+="${boot_arr[$i]}"
+            arm_block_tf+="${arm_flex_block_volumes[$i]:-0}"
+        done
+    fi
+    
+    arm_ocpus_tf+="]"
+    arm_memory_tf+="]"
+    arm_boot_tf+="]"
+    arm_block_tf+="]"
+    
+    cat > variables.tf << EOF
+# Oracle Cloud Infrastructure Terraform Variables
+# Generated: $(date)
+# Configuration: ${amd_micro_instance_count}x AMD + ${arm_flex_instance_count}x ARM instances
+
+locals {
+  # Core identifiers
+  tenancy_ocid    = "$tenancy_ocid"
+  compartment_id  = "$tenancy_ocid"
+  user_ocid       = "$user_ocid"
+  region          = "$region"
+  
+  # Ubuntu Images (region-specific)
+  ubuntu_x86_image_ocid = "$ubuntu_image_ocid"
+  ubuntu_arm_image_ocid = "$ubuntu_arm_flex_image_ocid"
+  
+  # SSH Configuration
+  ssh_pubkey_path      = pathexpand("./ssh_keys/id_rsa.pub")
+  ssh_pubkey_data      = file(pathexpand("./ssh_keys/id_rsa.pub"))
+  ssh_private_key_path = pathexpand("./ssh_keys/id_rsa")
+  
+  # AMD x86 Micro Instances Configuration
+  amd_micro_instance_count      = $amd_micro_instance_count
+  amd_micro_boot_volume_size_gb = $amd_micro_boot_volume_size_gb
+  amd_micro_hostnames           = $amd_hostnames_tf
+  amd_block_volume_size_gb      = 0
+  
+  # ARM A1 Flex Instances Configuration
+  arm_flex_instance_count       = $arm_flex_instance_count
+  arm_flex_ocpus_per_instance   = $arm_ocpus_tf
+  arm_flex_memory_per_instance  = $arm_memory_tf
+  arm_flex_boot_volume_size_gb  = $arm_boot_tf
+  arm_flex_hostnames            = $arm_hostnames_tf
+  arm_block_volume_sizes        = $arm_block_tf
+  
+  # Storage calculations
+  total_amd_storage = local.amd_micro_instance_count * local.amd_micro_boot_volume_size_gb
+  total_arm_storage = local.arm_flex_instance_count > 0 ? sum(local.arm_flex_boot_volume_size_gb) : 0
+  total_block_storage = (local.amd_micro_instance_count * local.amd_block_volume_size_gb) + (local.arm_flex_instance_count > 0 ? sum(local.arm_block_volume_sizes) : 0)
+  total_storage = local.total_amd_storage + local.total_arm_storage + local.total_block_storage
+}
+
+# Free Tier Limits
+variable "free_tier_max_storage_gb" {
+  description = "Maximum storage for Oracle Free Tier"
+  type        = number
+  default     = $FREE_TIER_MAX_STORAGE_GB
+}
+
+variable "free_tier_max_arm_ocpus" {
+  description = "Maximum ARM OCPUs for Oracle Free Tier"
+  type        = number
+  default     = $FREE_TIER_MAX_ARM_OCPUS
+}
+
+variable "free_tier_max_arm_memory_gb" {
+  description = "Maximum ARM memory for Oracle Free Tier"
+  type        = number
+  default     = $FREE_TIER_MAX_ARM_MEMORY_GB
+}
+
+# Validation checks
+check "storage_limit" {
+  assert {
+    condition     = local.total_storage <= var.free_tier_max_storage_gb
+    error_message = "Total storage (\${local.total_storage}GB) exceeds Free Tier limit (\${var.free_tier_max_storage_gb}GB)"
+  }
+}
+
+check "arm_ocpu_limit" {
+  assert {
+    condition     = local.arm_flex_instance_count == 0 || sum(local.arm_flex_ocpus_per_instance) <= var.free_tier_max_arm_ocpus
+    error_message = "Total ARM OCPUs exceed Free Tier limit (\${var.free_tier_max_arm_ocpus})"
+  }
+}
+
+check "arm_memory_limit" {
+  assert {
+    condition     = local.arm_flex_instance_count == 0 || sum(local.arm_flex_memory_per_instance) <= var.free_tier_max_arm_memory_gb
+    error_message = "Total ARM memory exceeds Free Tier limit (\${var.free_tier_max_arm_memory_gb}GB)"
+  }
+}
+EOF
+    
+    print_success "variables.tf created"
+}
+
+create_terraform_datasources() {
+    print_status "Creating data_sources.tf..."
+    
+    [ -f "data_sources.tf" ] && cp data_sources.tf "data_sources.tf.bak.$(date +%Y%m%d_%H%M%S)"
+    
+    cat > data_sources.tf << 'EOF'
+# OCI Data Sources
+# Fetches dynamic information from Oracle Cloud
+
+# Availability Domains
+data "oci_identity_availability_domains" "ads" {
+  compartment_id = local.tenancy_ocid
+}
+
+# Tenancy Information
+data "oci_identity_tenancy" "tenancy" {
+  tenancy_id = local.tenancy_ocid
+}
+
+# Available Regions
+data "oci_identity_regions" "regions" {}
+
+# Region Subscriptions
+data "oci_identity_region_subscriptions" "subscriptions" {
+  tenancy_id = local.tenancy_ocid
+}
+EOF
+    
+    print_success "data_sources.tf created"
+}
+
+create_terraform_main() {
+    print_status "Creating main.tf..."
+    
+    [ -f "main.tf" ] && cp main.tf "main.tf.bak.$(date +%Y%m%d_%H%M%S)"
+    
+    cat > main.tf << 'EOFMAIN'
+# Oracle Cloud Infrastructure - Main Configuration
+# Always Free Tier Optimized
+
+# ============================================================================
+# NETWORKING
+# ============================================================================
+
+resource "oci_core_vcn" "main" {
+  compartment_id = local.compartment_id
+  cidr_blocks    = ["10.0.0.0/16"]
+  display_name   = "main-vcn"
+  dns_label      = "mainvcn"
+  is_ipv6enabled = true
+  
+  freeform_tags = {
+    "Purpose" = "AlwaysFreeTier"
+    "Managed" = "Terraform"
+  }
+}
+
+resource "oci_core_internet_gateway" "main" {
+  compartment_id = local.compartment_id
+  vcn_id         = oci_core_vcn.main.id
+  display_name   = "main-igw"
+  enabled        = true
+}
+
+resource "oci_core_default_route_table" "main" {
+  manage_default_resource_id = oci_core_vcn.main.default_route_table_id
+  display_name               = "main-rt"
+  
+  route_rules {
+    destination       = "0.0.0.0/0"
+    destination_type  = "CIDR_BLOCK"
+    network_entity_id = oci_core_internet_gateway.main.id
+  }
+  
+  route_rules {
+    destination       = "::/0"
+    destination_type  = "CIDR_BLOCK"
+    network_entity_id = oci_core_internet_gateway.main.id
+  }
+}
+
+resource "oci_core_default_security_list" "main" {
+  manage_default_resource_id = oci_core_vcn.main.default_security_list_id
+  display_name               = "main-sl"
+  
+  # Allow all egress
+  egress_security_rules {
+    destination = "0.0.0.0/0"
+    protocol    = "all"
+  }
+  
+  egress_security_rules {
+    destination = "::/0"
+    protocol    = "all"
+  }
+  
+  # SSH
+  ingress_security_rules {
+    protocol = "6"
+    source   = "0.0.0.0/0"
+    tcp_options {
+      min = 22
+      max = 22
+    }
+  }
+  
+  # HTTP
+  ingress_security_rules {
+    protocol = "6"
+    source   = "0.0.0.0/0"
+    tcp_options {
+      min = 80
+      max = 80
+    }
+  }
+  
+  # HTTPS
+  ingress_security_rules {
+    protocol = "6"
+    source   = "0.0.0.0/0"
+    tcp_options {
+      min = 443
+      max = 443
+    }
+  }
+  
+  # ICMP
+  ingress_security_rules {
+    protocol = "1"
+    source   = "0.0.0.0/0"
+  }
+}
+
+resource "oci_core_subnet" "main" {
+  compartment_id = local.compartment_id
+  vcn_id         = oci_core_vcn.main.id
+  cidr_block     = "10.0.1.0/24"
+  display_name   = "main-subnet"
+  dns_label      = "mainsubnet"
+  
+  route_table_id    = oci_core_default_route_table.main.id
+  security_list_ids = [oci_core_default_security_list.main.id]
+  
+  # IPv6 - use first /64 block from VCN's /56
+  ipv6cidr_blocks = [cidrsubnet(oci_core_vcn.main.ipv6cidr_blocks[0], 8, 0)]
+}
+
+# ============================================================================
+# COMPUTE INSTANCES
+# ============================================================================
+
+# AMD x86 Micro Instances
+resource "oci_core_instance" "amd" {
+  count = local.amd_micro_instance_count
+  
+  availability_domain = data.oci_identity_availability_domains.ads.availability_domains[0].name
+  compartment_id      = local.compartment_id
+  display_name        = local.amd_micro_hostnames[count.index]
+  shape               = "VM.Standard.E2.1.Micro"
+  
+  create_vnic_details {
+    subnet_id        = oci_core_subnet.main.id
+    display_name     = "${local.amd_micro_hostnames[count.index]}-vnic"
+    assign_public_ip = true
+    hostname_label   = local.amd_micro_hostnames[count.index]
+  }
+  
+  source_details {
+    source_type             = "image"
+    source_id               = local.ubuntu_x86_image_ocid
+    boot_volume_size_in_gbs = local.amd_micro_boot_volume_size_gb
+  }
+  
+  metadata = {
+    ssh_authorized_keys = local.ssh_pubkey_data
+    user_data = base64encode(templatefile("${path.module}/cloud-init.yaml", {
+      hostname = local.amd_micro_hostnames[count.index]
+    }))
+  }
+  
+  freeform_tags = {
+    "Purpose"      = "AlwaysFreeTier"
+    "InstanceType" = "AMD-Micro"
+    "Managed"      = "Terraform"
+  }
+  
+  lifecycle {
+    ignore_changes = [
+      source_details[0].source_id,  # Ignore image updates
+      defined_tags,
+    ]
+  }
+}
+
+# ARM A1 Flex Instances
+resource "oci_core_instance" "arm" {
+  count = local.arm_flex_instance_count
+  
+  availability_domain = data.oci_identity_availability_domains.ads.availability_domains[0].name
+  compartment_id      = local.compartment_id
+  display_name        = local.arm_flex_hostnames[count.index]
+  shape               = "VM.Standard.A1.Flex"
+  
+  shape_config {
+    ocpus         = local.arm_flex_ocpus_per_instance[count.index]
+    memory_in_gbs = local.arm_flex_memory_per_instance[count.index]
+  }
+  
+  create_vnic_details {
+    subnet_id        = oci_core_subnet.main.id
+    display_name     = "${local.arm_flex_hostnames[count.index]}-vnic"
+    assign_public_ip = true
+    hostname_label   = local.arm_flex_hostnames[count.index]
+  }
+  
+  source_details {
+    source_type             = "image"
+    source_id               = local.ubuntu_arm_image_ocid
+    boot_volume_size_in_gbs = local.arm_flex_boot_volume_size_gb[count.index]
+  }
+  
+  metadata = {
+    ssh_authorized_keys = local.ssh_pubkey_data
+    user_data = base64encode(templatefile("${path.module}/cloud-init.yaml", {
+      hostname = local.arm_flex_hostnames[count.index]
+    }))
+  }
+  
+  freeform_tags = {
+    "Purpose"      = "AlwaysFreeTier"
+    "InstanceType" = "ARM-A1-Flex"
+    "Managed"      = "Terraform"
+  }
+  
+  lifecycle {
+    ignore_changes = [
+      source_details[0].source_id,
+      defined_tags,
+    ]
+  }
+}
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
+output "amd_instances" {
+  description = "AMD instance information"
+  value = local.amd_micro_instance_count > 0 ? {
+    for i in range(local.amd_micro_instance_count) : local.amd_micro_hostnames[i] => {
+      id         = oci_core_instance.amd[i].id
+      public_ip  = oci_core_instance.amd[i].public_ip
+      private_ip = oci_core_instance.amd[i].private_ip
+      state      = oci_core_instance.amd[i].state
+      ssh        = "ssh -i ./ssh_keys/id_rsa ubuntu@${oci_core_instance.amd[i].public_ip}"
+    }
+  } : {}
+}
+
+output "arm_instances" {
+  description = "ARM instance information"
+  value = local.arm_flex_instance_count > 0 ? {
+    for i in range(local.arm_flex_instance_count) : local.arm_flex_hostnames[i] => {
+      id         = oci_core_instance.arm[i].id
+      public_ip  = oci_core_instance.arm[i].public_ip
+      private_ip = oci_core_instance.arm[i].private_ip
+      state      = oci_core_instance.arm[i].state
+      ocpus      = local.arm_flex_ocpus_per_instance[i]
+      memory_gb  = local.arm_flex_memory_per_instance[i]
+      ssh        = "ssh -i ./ssh_keys/id_rsa ubuntu@${oci_core_instance.arm[i].public_ip}"
+    }
+  } : {}
+}
+
+output "network" {
+  description = "Network information"
+  value = {
+    vcn_id     = oci_core_vcn.main.id
+    vcn_cidr   = oci_core_vcn.main.cidr_blocks[0]
+    subnet_id  = oci_core_subnet.main.id
+    subnet_cidr = oci_core_subnet.main.cidr_block
+  }
+}
+
+output "summary" {
+  description = "Infrastructure summary"
+  value = {
+    region          = local.region
+    total_amd       = local.amd_micro_instance_count
+    total_arm       = local.arm_flex_instance_count
+    total_storage   = local.total_storage
+    free_tier_limit = 200
+  }
+}
+EOFMAIN
+    
+    print_success "main.tf created"
+}
+
+create_terraform_block_volumes() {
+    print_status "Creating block_volumes.tf..."
+    
+    [ -f "block_volumes.tf" ] && cp block_volumes.tf "block_volumes.tf.bak.$(date +%Y%m%d_%H%M%S)"
+    
+    cat > block_volumes.tf << 'EOF'
+# Block Volume Resources (Optional)
+# Block volumes provide additional storage beyond boot volumes
+
+# AMD Block Volumes
+resource "oci_core_volume" "amd_block" {
+  count = local.amd_block_volume_size_gb > 0 ? local.amd_micro_instance_count : 0
+  
+  compartment_id      = local.compartment_id
+  availability_domain = data.oci_identity_availability_domains.ads.availability_domains[0].name
+  display_name        = "${local.amd_micro_hostnames[count.index]}-block"
+  size_in_gbs         = local.amd_block_volume_size_gb
+  
+  freeform_tags = {
+    "Purpose" = "AlwaysFreeTier"
+    "Type"    = "BlockVolume"
+    "Managed" = "Terraform"
+  }
+}
+
+resource "oci_core_volume_attachment" "amd_block" {
+  count = local.amd_block_volume_size_gb > 0 ? local.amd_micro_instance_count : 0
+  
+  attachment_type = "paravirtualized"
+  instance_id     = oci_core_instance.amd[count.index].id
+  volume_id       = oci_core_volume.amd_block[count.index].id
+}
+
+# ARM Block Volumes
+resource "oci_core_volume" "arm_block" {
+  count = local.arm_flex_instance_count > 0 ? length([for s in local.arm_block_volume_sizes : s if s > 0]) : 0
+  
+  compartment_id      = local.compartment_id
+  availability_domain = data.oci_identity_availability_domains.ads.availability_domains[0].name
+  display_name        = "${local.arm_flex_hostnames[count.index]}-block"
+  size_in_gbs         = [for s in local.arm_block_volume_sizes : s if s > 0][count.index]
+  
+  freeform_tags = {
+    "Purpose" = "AlwaysFreeTier"
+    "Type"    = "BlockVolume"
+    "Managed" = "Terraform"
+  }
+}
+
+resource "oci_core_volume_attachment" "arm_block" {
+  count = local.arm_flex_instance_count > 0 ? length([for s in local.arm_block_volume_sizes : s if s > 0]) : 0
+  
+  attachment_type = "paravirtualized"
+  instance_id     = oci_core_instance.arm[count.index].id
+  volume_id       = oci_core_volume.arm_block[count.index].id
+}
+EOF
+    
+    print_success "block_volumes.tf created"
+}
+
+create_cloud_init() {
+    print_status "Creating cloud-init.yaml..."
+    
+    [ -f "cloud-init.yaml" ] && cp cloud-init.yaml "cloud-init.yaml.bak.$(date +%Y%m%d_%H%M%S)"
+    
+    cat > cloud-init.yaml << 'EOF'
+#cloud-config
+hostname: ${hostname}
+fqdn: ${hostname}.local
+manage_etc_hosts: true
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - curl
+  - wget
+  - git
+  - htop
+  - vim
+  - unzip
+  - jq
+  - tmux
+  - net-tools
+  - iotop
+  - ncdu
+
+runcmd:
+  - echo "Instance ${hostname} initialized at $(date)" >> /var/log/cloud-init-complete.log
+  - systemctl enable --now fail2ban || true
+
+# Basic security hardening
+write_files:
+  - path: /etc/ssh/sshd_config.d/hardening.conf
+    content: |
+      PermitRootLogin no
+      PasswordAuthentication no
+      MaxAuthTries 3
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+
+timezone: UTC
+ssh_pwauth: false
+
+final_message: "Instance ${hostname} ready after $UPTIME seconds"
+EOF
+    
+    print_success "cloud-init.yaml created"
+}
+
+# ============================================================================
+# TERRAFORM IMPORT AND STATE MANAGEMENT
+# ============================================================================
+
+import_existing_resources() {
+    print_header "IMPORTING EXISTING RESOURCES"
+    
+    if [ ${#EXISTING_VCNS[@]} -eq 0 ] && [ ${#EXISTING_AMD_INSTANCES[@]} -eq 0 ] && [ ${#EXISTING_ARM_INSTANCES[@]} -eq 0 ]; then
+        print_status "No existing resources to import"
+        return 0
+    fi
+    
+    # Initialize Terraform first
+    print_status "Initializing Terraform..."
+    if ! retry_with_backoff "terraform init -input=false" >/dev/null 2>&1; then
+        print_error "Terraform init failed after retries"
+        return 1
+    fi
+    
+    local imported=0
+    local failed=0
+    
+    # Import VCN
+    if [ ${#EXISTING_VCNS[@]} -gt 0 ]; then
+        local first_vcn_id
+        first_vcn_id=$(echo "${!EXISTING_VCNS[@]}" | tr ' ' '\n' | head -1)
+        
+        if [ -n "$first_vcn_id" ]; then
+            local vcn_name
+            vcn_name=$(echo "${EXISTING_VCNS[$first_vcn_id]}" | cut -d'|' -f1)
+            print_status "Importing VCN: $vcn_name"
+            
+            if terraform state show oci_core_vcn.main >/dev/null 2>&1; then
+                print_status "  Already in state"
+            elif run_cmd_with_retries_and_check "terraform import oci_core_vcn.main \"$first_vcn_id\"" >/dev/null 2>&1; then
+                print_success "  Imported successfully"
+                imported=$((imported + 1))
+                
+                # Import related networking resources
+                import_vcn_components "$first_vcn_id"
+            else
+                print_warning "  Failed to import (see logs above)"
+                failed=$((failed + 1))
+            fi
+        fi
+    fi
+    
+    # Import AMD instances
+    local amd_index=0
+    for instance_id in "${!EXISTING_AMD_INSTANCES[@]}"; do
+        local instance_name
+        instance_name=$(echo "${EXISTING_AMD_INSTANCES[$instance_id]}" | cut -d'|' -f1)
+        print_status "Importing AMD instance: $instance_name"
+        
+        if terraform state show "oci_core_instance.amd[$amd_index]" >/dev/null 2>&1; then
+            print_status "  Already in state"
+        elif run_cmd_with_retries_and_check "terraform import \"oci_core_instance.amd[$amd_index]\" \"$instance_id\"" >/dev/null 2>&1; then
+            print_success "  Imported successfully"
+            imported=$((imported + 1))
+        else
+            print_warning "  Failed to import (see logs above)"
+            failed=$((failed + 1))
+        fi
+        
+        amd_index=$((amd_index + 1))
+        [ "$amd_index" -ge "$amd_micro_instance_count" ] && break
+    done
+    
+    # Import ARM instances
+    local arm_index=0
+    for instance_id in "${!EXISTING_ARM_INSTANCES[@]}"; do
+        local instance_name
+        instance_name=$(echo "${EXISTING_ARM_INSTANCES[$instance_id]}" | cut -d'|' -f1)
+        print_status "Importing ARM instance: $instance_name"
+        
+        if terraform state show "oci_core_instance.arm[$arm_index]" >/dev/null 2>&1; then
+            print_status "  Already in state"
+        elif run_cmd_with_retries_and_check "terraform import \"oci_core_instance.arm[$arm_index]\" \"$instance_id\"" >/dev/null 2>&1; then
+            print_success "  Imported successfully"
+            imported=$((imported + 1))
+        else
+            print_warning "  Failed to import (see logs above)"
+            failed=$((failed + 1))
+        fi
+        
+        arm_index=$((arm_index + 1))
+        [ "$arm_index" -ge "$arm_flex_instance_count" ] && break
+    done
+    
+    print_status ""
+    print_success "Import complete: $imported imported, $failed failed"
+}
+
+import_vcn_components() {
+    local vcn_id="$1"
+    
+    # Import Internet Gateway
+    for ig_id in "${!EXISTING_INTERNET_GATEWAYS[@]}"; do
+        local ig_vcn
+        ig_vcn=$(echo "${EXISTING_INTERNET_GATEWAYS[$ig_id]}" | cut -d'|' -f2)
+        if [ "$ig_vcn" = "$vcn_id" ]; then
+            if ! terraform state show oci_core_internet_gateway.main >/dev/null 2>&1; then
+                terraform import oci_core_internet_gateway.main "$ig_id" 2>/dev/null && \
+                    print_status "    Imported Internet Gateway" || true
+            fi
+            break
+        fi
+    done
+    
+    # Import Subnet
+    for subnet_id in "${!EXISTING_SUBNETS[@]}"; do
+        local subnet_vcn
+        subnet_vcn=$(echo "${EXISTING_SUBNETS[$subnet_id]}" | cut -d'|' -f3)
+        if [ "$subnet_vcn" = "$vcn_id" ]; then
+            if ! terraform state show oci_core_subnet.main >/dev/null 2>&1; then
+                terraform import oci_core_subnet.main "$subnet_id" 2>/dev/null && \
+                    print_status "    Imported Subnet" || true
+            fi
+            break
+        fi
+    done
+    
+    # Import Route Table (default)
+    for rt_id in "${!EXISTING_ROUTE_TABLES[@]}"; do
+        local rt_vcn rt_name
+        rt_vcn=$(echo "${EXISTING_ROUTE_TABLES[$rt_id]}" | cut -d'|' -f2)
+        rt_name=$(echo "${EXISTING_ROUTE_TABLES[$rt_id]}" | cut -d'|' -f1)
+        if [ "$rt_vcn" = "$vcn_id" ] && [[ "$rt_name" == *"Default"* || "$rt_name" == *"default"* ]]; then
+            if ! terraform state show oci_core_default_route_table.main >/dev/null 2>&1; then
+                terraform import oci_core_default_route_table.main "$rt_id" 2>/dev/null && \
+                    print_status "    Imported Route Table" || true
+            fi
+            break
+        fi
+    done
+    
+    # Import Security List (default)
+    for sl_id in "${!EXISTING_SECURITY_LISTS[@]}"; do
+        local sl_vcn sl_name
+        sl_vcn=$(echo "${EXISTING_SECURITY_LISTS[$sl_id]}" | cut -d'|' -f2)
+        sl_name=$(echo "${EXISTING_SECURITY_LISTS[$sl_id]}" | cut -d'|' -f1)
+        if [ "$sl_vcn" = "$vcn_id" ] && [[ "$sl_name" == *"Default"* || "$sl_name" == *"default"* ]]; then
+            if ! terraform state show oci_core_default_security_list.main >/dev/null 2>&1; then
+                terraform import oci_core_default_security_list.main "$sl_id" 2>/dev/null && \
+                    print_status "    Imported Security List" || true
+            fi
+            break
+        fi
+    done
+}
+
+# ============================================================================
+# TERRAFORM WORKFLOW
+# ============================================================================
+
+run_terraform_workflow() {
+    print_header "TERRAFORM WORKFLOW"
+    
+    # Step 1: Initialize
+    print_status "Step 1: Initializing Terraform..."
+    if ! retry_with_backoff "terraform init -input=false -upgrade" >/dev/null 2>&1; then
+        print_error "Terraform init failed after retries"
+        return 1
+    fi
+    print_success "Terraform initialized"
+    
+    # Step 2: Import existing resources
+    if [ ${#EXISTING_VCNS[@]} -gt 0 ] || [ ${#EXISTING_AMD_INSTANCES[@]} -gt 0 ] || [ ${#EXISTING_ARM_INSTANCES[@]} -gt 0 ]; then
+        print_status "Step 2: Importing existing resources..."
+        import_existing_resources
+    else
+        print_status "Step 2: No existing resources to import"
+    fi
+    
+    # Step 3: Validate
+    print_status "Step 3: Validating configuration..."
+    if ! terraform validate; then
+        print_error "Terraform validation failed"
+        return 1
+    fi
+    print_success "Configuration valid"
+    
+    # Step 4: Plan
+    print_status "Step 4: Creating execution plan..."
+    if ! terraform plan -out=tfplan -input=false; then
+        print_error "Terraform plan failed"
+        return 1
+    fi
+    print_success "Plan created successfully"
+    
+    # Show plan summary
+    echo ""
+    print_status "Plan summary:"
+    terraform show -no-color tfplan | grep -E "^(Plan:|  #|will be)" | head -20 || true
+    echo ""
+    
+    # Step 5: Apply (with confirmation)
+    if [ "$AUTO_DEPLOY" = "true" ] || [ "$NON_INTERACTIVE" = "true" ]; then
+        print_status "Step 5: Auto-applying plan..."
+        apply_choice="Y"
+    else
+        echo -n -e "${BLUE}Apply this plan? [y/N]: ${NC}"
+        read -r apply_choice
+        apply_choice=${apply_choice:-N}
+    fi
+    
+    if [[ "$apply_choice" =~ ^[Yy]$ ]]; then
+        print_status "Applying Terraform plan..."
+        if out_of_capacity_auto_apply; then
+            print_success "Infrastructure deployed successfully!"
+            rm -f tfplan
+            
+            # Show outputs
+            echo ""
+            print_header "DEPLOYMENT COMPLETE"
+            terraform output -json 2>/dev/null | jq '.' || terraform output
+        else
+            print_error "Terraform apply failed"
+            return 1
+        fi
+    else
+        print_status "Plan saved as 'tfplan' - apply later with: terraform apply tfplan"
+    fi
+    
     return 0
 }
 
-# Main execution
-main() {
-    print_status "Starting OCI Terraform setup script for core infrastructure..."
-    print_status "This script will set up everything needed to run 'terraform init' and 'terraform apply'"
-    print_status "Using browser-based authentication for simplified setup"
-    
-    # Install required system packages
-    print_status "Installing required system packages..."
-    if ! command_exists jq; then
-        sudo apt-get update
-        sudo apt-get install -y jq openssl curl
-    fi
-    if ! command_exists awk; then
-        sudo apt-get update
-        sudo apt-get install -y mawk
-    fi
-    if ! command_exists grep; then
-        sudo apt-get update
-        sudo apt-get install -y grep
-    fi
-
-    # Check whether required commands were installed.
-    required_commands=("jq" "openssl" "ssh-keygen" "awk" "grep" "tr")
-    for cmd in "${required_commands[@]}"; do
-    if ! command_exists "$cmd"; then
-        print_error "$cmd is required but not installed."
-        exit 1
-    fi
-    done
-    
-    # Install Terraform
-    install_terraform
-    
-    # Install OCI CLI
-    install_oci_cli
-    
-    # Ensure we're in the virtual environment
-    source .venv/bin/activate
-    
-    # Setup OCI config (this handles browser authentication)
-    setup_oci_config
-    
-    # Fetch all required information
-    fetch_fingerprint
-    fetch_user_ocid
-    fetch_tenancy_ocid
-    fetch_region
-    fetch_availability_domains
-    fetch_region_images
-    
-    # Generate SSH keys
-    generate_ssh_keys
-    
-    # Skip configuration prompts if we're using existing config in non-interactive mode
-    if [ "$AUTO_USE_EXISTING" = "true" ] && [ -f "variables.tf" ]; then
-        print_status "Non-interactive mode with existing config: Skipping configuration prompts"
-        
-        # Load existing configurations
-        if [ -n "$ubuntu_arm_flex_image_ocid" ]; then
-            if load_existing_arm_config; then
-                print_success "Loaded existing ARM configuration"
-            else
-                print_warning "Could not load existing ARM config, using defaults"
-                arm_flex_instance_count=1
-                amd_micro_instance_count=0
-                amd_micro_boot_volume_size_gb=50  # Default value
-            fi
-        else
-            print_warning "ARM images not available in region $region"
-            arm_flex_instance_count=0
-            amd_micro_instance_count=2
-            amd_micro_boot_volume_size_gb=100  # Use more storage since no ARM instances (minimum 50GB each)
-        fi
-        
-        # Set default hostnames if not loaded
-        if [ "${#amd_micro_hostnames[@]}" -eq 0 ] && [ "$amd_micro_instance_count" -gt 0 ]; then
-            if [ "$amd_micro_instance_count" -eq 1 ]; then
-                amd_micro_hostnames=("amd-instance-1")
-            else
-                amd_micro_hostnames=("amd-instance-1" "amd-instance-2")
-            fi
-        fi
-        if [ "${#arm_flex_hostnames[@]}" -eq 0 ] && [ "$arm_flex_instance_count" -gt 0 ]; then
-            arm_flex_hostnames=("arm-instance-1")
-        fi
-        
-    else
-        # Prompt for ARM instance configuration (only if ARM images are available)
-        if [ -n "$ubuntu_arm_flex_image_ocid" ]; then
-        prompt_arm_flex_instance_config
-        else
-            print_warning "ARM images not available in region $region - skipping ARM instance configuration"
-            print_status "Only AMD x86 instances will be configured"
-            arm_flex_instance_count=0
-            amd_micro_instance_count=2
-            amd_micro_boot_volume_size_gb=100  # Use more storage since no ARM instances (minimum 50GB each)
-        fi
-        
-        # Prompt for instance hostnames
-        prompt_instance_hostnames
-    fi
-    
-    # Create Terraform variables
-    create_terraform_vars
-    
-    # Create Terraform provider configuration
-    create_terraform_provider
-    
-    # Create missing Terraform resources and data sources
-    create_missing_terraform_resources
-    
-    # Verify everything is set up correctly
-    verify_setup
-    
-    # Provide Terraform management options
+terraform_menu() {
     while true; do
-        terraform_management_menu
-        menu_result=$?
+        echo ""
+        print_header "TERRAFORM MANAGEMENT"
+        echo "  1) Full workflow (init → import → plan → apply)"
+        echo "  2) Plan only"
+        echo "  3) Apply existing plan"
+        echo "  4) Import existing resources"
+        echo "  5) Show current state"
+        echo "  6) Destroy infrastructure"
+        echo "  7) Reconfigure"
+        echo "  8) Exit"
+        echo ""
         
-        if [ $menu_result -eq 0 ]; then
-            # User chose to quit
-            break
-        elif [ $menu_result -eq 1 ]; then
-            # User chose to reconfigure - restart the configuration process
-            print_status "Restarting configuration process..."
-            
-            # Re-prompt for ARM instance configuration
-            if [ -n "$ubuntu_arm_flex_image_ocid" ]; then
-                prompt_arm_flex_instance_config
-            fi
-            
-            # Re-prompt for instance hostnames
-            prompt_instance_hostnames
-            
-            # Recreate Terraform variables
-            create_terraform_vars
-            
-            # Continue with the menu
-            continue
+        if [ "$AUTO_DEPLOY" = "true" ] || [ "$NON_INTERACTIVE" = "true" ]; then
+            choice=1
+            print_status "Auto mode: Running full workflow"
+        else
+            echo -n -e "${BLUE}Choose option [1]: ${NC}"
+            read -r choice
+            choice=${choice:-1}
         fi
+        
+        case $choice in
+            1)
+                run_terraform_workflow
+                [ "$AUTO_DEPLOY" = "true" ] && return 0
+                ;;
+            2)
+                terraform init -input=false && terraform plan
+                ;;
+            3)
+                if [ -f "tfplan" ]; then
+                    terraform apply tfplan
+                else
+                    print_error "No plan file found"
+                fi
+                ;;
+            4)
+                import_existing_resources
+                ;;
+            5)
+                if terraform state list 2>/dev/null && terraform output 2>/dev/null; then
+                    :
+                else
+                    print_status "No state found"
+                fi
+                ;;
+            6)
+                if confirm_action "DESTROY all infrastructure?" "N"; then
+                    terraform destroy
+                fi
+                ;;
+            7)
+                return 1  # Signal to reconfigure
+                ;;
+            8)
+                return 0
+                ;;
+            *)
+                print_error "Invalid choice"
+                ;;
+        esac
+        
+        if [ "$NON_INTERACTIVE" = "true" ]; then
+            return 0
+        fi
+        
+        echo ""
+        echo -n -e "${BLUE}Press Enter to continue...${NC}"
+        read -r
     done
-    
-    print_success "==================== SETUP COMPLETE ===================="
-    print_success "OCI Terraform setup completed successfully!"
-    print_success "Core Oracle Always Free Tier services configured!"
-    print_status ""
-    print_status "CONFIGURED SERVICES SUMMARY:"
-    print_status "  ✓ Compute: 2x AMD + configurable ARM instances"
-    print_status "  ✓ Networking: VCNs, subnets, security groups"
-    print_status "  ✓ Storage: Boot volumes (200GB total)"
-    print_status ""
-    print_status "FILES CREATED:"
-    print_status "  - ~/.oci/config (OCI CLI configuration with session token)"
-    if grep -q "security_token_file" ~/.oci/config; then
-        print_status "  - ~/.oci/sessions/ (Session token files)"
-    else
-        print_status "  - ~/.oci/oci_api_key.pem (Private API key)"
-        print_status "  - ~/.oci/oci_api_key_public.pem (Public API key)"
-    fi
-    print_status "  - ./ssh_keys/id_rsa (SSH private key)"
-    print_status "  - ./ssh_keys/id_rsa.pub (SSH public key)"
-    print_status "  - ./variables.tf (Core Always Free Tier configuration)"
-    print_status "  - ./data_sources.tf (Required data sources)"
-    print_status "  - ./block_volumes.tf (Block volume resources)"
-    print_status ""
-    if [ -f "tfplan" ]; then
-        print_status "TERRAFORM STATUS:"
-        print_status "  ✓ Terraform plan created and ready to apply"
-        print_status "  - Run: terraform apply tfplan"
-    elif [ -f ".terraform/terraform.tfstate" ]; then
-        print_status "TERRAFORM STATUS:"
-        print_status "  ✓ Terraform initialized and infrastructure deployed"
-        print_status "  - Run: terraform show (to view current state)"
-        print_status "  - Run: terraform plan (to see any changes)"
-    else
-        print_status "TERRAFORM NEXT STEPS:"
-        print_status "  1. terraform init"
-        print_status "  2. terraform plan"
-        print_status "  3. terraform apply"
-        print_status ""
-        print_status "Or re-run this script and choose option 1 for full workflow"
-    fi
-    print_status ""
-    print_status "USEFUL COMMANDS:"
-    print_status "  - terraform import <resource> <ocid> (import existing resources)"
-    print_status "  - terraform state list (show managed resources)"
-    print_status "  - terraform destroy (remove all infrastructure)"
-    print_status "========================================================="
 }
 
-# Execute main function
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+main() {
+    print_header "OCI TERRAFORM SETUP - IDEMPOTENT EDITION"
+    print_status "This script safely manages Oracle Cloud Free Tier resources"
+    print_status "Safe to run multiple times - will detect and reuse existing resources"
+    echo ""
+    
+    # Phase 1: Prerequisites
+    install_prerequisites
+    install_terraform
+    install_oci_cli
+    
+    # Activate virtual environment if it exists
+    # shellcheck disable=SC1091
+    [ -f ".venv/bin/activate" ] && source .venv/bin/activate
+    
+    # Phase 2: Authentication
+    setup_oci_config
+    
+    # Phase 3: Fetch OCI information
+    fetch_oci_config_values
+    fetch_availability_domains
+    fetch_ubuntu_images
+    generate_ssh_keys
+    
+    # Phase 4: Resource inventory (CRITICAL for idempotency)
+    inventory_all_resources
+    
+    # Phase 5: Configuration
+    if [ "$SKIP_CONFIG" != "true" ]; then
+        prompt_configuration
+    else
+        load_existing_config || configure_from_existing_instances
+    fi
+    
+    # Phase 6: Generate Terraform files
+    create_terraform_files
+    
+    # Phase 7: Terraform management
+    while true; do
+        terraform_menu
+        result=$?
+        [ $result -eq 0 ] && break
+        
+        # Reconfigure requested
+        prompt_configuration
+        create_terraform_files
+    done
+    
+    print_header "SETUP COMPLETE"
+    print_success "Oracle Cloud Free Tier infrastructure managed successfully"
+    echo ""
+    print_status "Files created/updated:"
+    print_status "  • provider.tf - OCI provider configuration"
+    print_status "  • variables.tf - Instance configuration"
+    print_status "  • main.tf - Infrastructure resources"
+    print_status "  • data_sources.tf - OCI data sources"
+    print_status "  • block_volumes.tf - Storage volumes"
+    print_status "  • cloud-init.yaml - Instance initialization"
+    echo ""
+    print_status "To manage your infrastructure:"
+    print_status "  terraform plan    - Preview changes"
+    print_status "  terraform apply   - Apply changes"
+    print_status "  terraform destroy - Remove all resources"
+}
+
+# Execute
 main "$@"

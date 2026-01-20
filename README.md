@@ -130,6 +130,28 @@ bash scripts/setup_oci_terraform.sh          # Installs and configures OCI CLI, 
 # [INFO] =========================================================
 ```
 
+### Helper scripts
+
+A convenience script is provided to retry `terraform apply` when OCI reports temporary "Out of Capacity" errors. It performs exponential backoff and will stop on non-retryable errors.
+
+Usage:
+
+```bash
+# Run retry helper with default settings (auto-approve):
+make apply-retry
+
+# Or run it directly
+./scripts/out_of_capacity.sh --plan tfplan
+
+# Run quick repository checks locally
+make ci-check
+
+# Run shellcheck locally (requires shellcheck installed)
+make lint
+```
+
+The helper logs to `scripts/out_of_capacity.log` so you can inspect attempts and failure reasons.
+
 ---
 
 ## 🔍 Accessibility Philosophy
